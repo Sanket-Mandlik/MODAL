@@ -87,7 +87,6 @@ def run_webui():
         "--no-half-vae",
         "--xformers",
         "--enable-insecure-extension-access",
-        "--gradio-auth", "admin:password123",  # Change this!
         "--gradio-img2img-tool", "color-sketch",
         "--gradio-inpaint-tool", "color-sketch",
     ], check=True)
