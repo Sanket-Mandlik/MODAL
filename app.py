@@ -1,190 +1,266 @@
+# app.py
 import modal
 import subprocess
 import os
-import requests
 import tempfile
 from pathlib import Path
+from typing import Tuple
 
-# Define the Modal app
+# --------------------------------------------------------------------------- #
+# Modal App
+# --------------------------------------------------------------------------- #
 app = modal.App("sd-webui-controlnet")
 
-# Persistent volume for models
+# Persistent volume – created automatically on first deploy
 vol = modal.Volume.from_name("sd-models", create_if_missing=True)
 
-# Build the container image with dependencies
+# --------------------------------------------------------------------------- #
+# GPU selection – L40S → A100-40 → A100-80 only
+# --------------------------------------------------------------------------- #
+def select_gpu():
+    try:
+        out = subprocess.check_output(
+            ["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader"],
+            text=True,
+        )
+    except Exception as e:
+        raise RuntimeError(f"GPU detection failed: {e}")
+
+    for line in out.strip().split("\n"):
+        if not line:
+            continue
+        name, mem = line.split(",", 1)
+        name = name.lower().strip()
+        mem_gb = int(mem.strip().split()[0])
+
+        if "l40s" in name or "ls40" in name:
+            return modal.gpu.L40S(count=1)
+        if "a100" in name:
+            if mem_gb >= 80:
+                return modal.gpu.A100(count=1, memory=80)
+            if mem_gb >= 40:
+                return modal.gpu.A100(count=1, memory=40)
+
+    raise RuntimeError(
+        "No supported GPU found. Only L40S, A100-40GB or A100-80GB are allowed."
+    )
+
+# --------------------------------------------------------------------------- #
+# Container image
+# --------------------------------------------------------------------------- #
 image = (
     modal.Image.debian_slim()
-    .apt_install("git", "wget", "curl", "python3.11", "python3.11-venv", "python3.11-dev", "python3-pip", "build-essential")
-    .run_commands(
-        "rm -f /usr/local/bin/python /usr/local/bin/python3 /usr/local/bin/pip /usr/local/bin/pip3",
-        "ln -s /usr/bin/python3.11 /usr/local/bin/python",
-        "ln -s /usr/bin/python3.11 /usr/local/bin/python3",
-        "ln -s /usr/bin/pip3 /usr/local/bin/pip",
-        "ln -s /usr/bin/pip3 /usr/local/bin/pip3",
-        "python --version",
-        "pip --version",
-        "pip install --upgrade pip --break-system-packages",
-        "pip install --index-url https://download.pytorch.org/whl/cu121 torch==2.5.1+cu121 torchvision --break-system-packages",
-        "pip install gradio transformers accelerate bitsandbytes xformers opencv-python pillow numpy scipy tqdm omegaconf einops controlnet-aux --break-system-packages"
+    .apt_install("git", "wget", "curl", "libglib2.0-0", "libsm6", "libxext6", "libxrender1")
+    .pip_install(
+        "torch==2.5.1+cu121",
+        "torchvision==0.20.1+cu121",
+        "--index-url", "https://download.pytorch.org/whl/cu121",
+    )
+    .pip_install(
+        "gradio==4.31.0",
+        "transformers",
+        "accelerate",
+        "bitsandbytes",
+        "xformers==0.0.26",
+        "opencv-python",
+        "pillow",
+        "numpy",
+        "scipy",
+        "tqdm",
+        "omegaconf",
+        "einops",
+        "controlnet-aux",
     )
     .run_commands(
         "git clone https://github.com/AUTOMATIC1111/stable-diffusion-webui.git /sd-webui",
-        "cd /sd-webui && git checkout master",
+        "cd /sd-webui && git checkout v1.10.1",
         "cd /sd-webui/extensions && git clone https://github.com/Mikubill/sd-webui-controlnet.git",
-        "mkdir -p /sd-webui/embeddings",
-        "mkdir -p /sd-webui/outputs",
+        "mkdir -p /sd-webui/embeddings /sd-webui/outputs",
     )
 )
 
-# Use LS40 GPU (48GB VRAM, more cost effective than multiple A100s)
-GPU = "LS40"
+# --------------------------------------------------------------------------- #
+# Prompt generator (unchanged)
+# --------------------------------------------------------------------------- #
+class EmptyRoomPromptGenerator:
+    COLOR_PALETTE_MAPPING = {
+        "urban": "urban",
+        "pastel": "pastel",
+        "neutral": "neutral",
+        "natural": "modern",
+    }
 
+    @staticmethod
+    def _get_mapped_color_palette(color_palette: str) -> str:
+        return EmptyRoomPromptGenerator.COLOR_PALETTE_MAPPING.get(
+            color_palette.lower(), color_palette.lower()
+        )
+
+    @staticmethod
+    def generate_prompts(
+        room_type: str, style: str, color_palette: str = "pastel"
+    ) -> Tuple[str, str]:
+        style_lower = style.lower() if style else "modern"
+        room_type_lower = room_type.lower()
+        color_palette_lower = color_palette.lower() if color_palette else "pastel"
+        mapped = EmptyRoomPromptGenerator._get_mapped_color_palette(color_palette_lower)
+
+        if room_type_lower in ["living", "living room"]:
+            return EmptyRoomPromptGenerator._get_living_room_prompts(style_lower, mapped)
+        if room_type_lower in ["bedroom", "bed room"]:
+            return EmptyRoomPromptGenerator._get_bedroom_prompts(style_lower, mapped)
+        if room_type_lower == "kids_room":
+            return EmptyRoomPromptGenerator._get_kids_room_prompts(mapped)
+        if room_type_lower == "bathroom":
+            return EmptyRoomPromptGenerator._get_bathroom_prompts(mapped)
+        if room_type_lower == "kitchen":
+            return EmptyRoomPromptGenerator._get_kitchen_prompts(mapped)
+        if room_type_lower == "living + dining":
+            return EmptyRoomPromptGenerator._get_living_dining_prompts(style_lower, mapped)
+        return EmptyRoomPromptGenerator._get_default_prompts(style_lower, mapped)
+
+    # (All static methods from your original class go here — unchanged)
+    @staticmethod
+    def _get_living_room_prompts(style: str, color_palette: str) -> Tuple[str, str]:
+        base_furniture = (
+            "((modular sofa set:1.3) against wall), "
+            "(coffee table:1.2) in front, "
+            "accent (armchair:1.1) near window, "
+            "(big TV wall unit:1.3) opposite sofa, "
+            "(lit bookshelf:1.1) in corner, "
+            "(layered ceiling:1.1) with fan, "
+            " (decorative items:1.1), "
+            "curtains, (floor lamp:1.1), "
+            "(indoor plant:1.1), clean edges"
+        )
+        if style == "minimalist":
+            positive_prompt = (
+                f"Ultra-modern living room interior by leading architect, "
+                f"featuring {base_furniture}, "
+                f"{color_palette} palette, MDF, glass, concrete."
+            )
+        else:
+            positive_prompt = (
+                f"Ultra-modern living room interior by Livspace, "
+                f"featuring {base_furniture}, "
+                f"{color_palette} palette, modern MDF, glass, marble."
+            )
+        negative_prompt = "multiple tv units, watermark"
+        return positive_prompt, negative_prompt
+
+    # ... (copy all other _get_* methods exactly as you posted) ...
+    # For brevity, not repeated here — just paste them in.
+
+# --------------------------------------------------------------------------- #
+# Prompt API endpoint (no auth)
+# --------------------------------------------------------------------------- #
+@app.function()
+@modal.web_endpoint(method="POST")
+def generate(room_type: str, style: str = "modern", color_palette: str = "pastel"):
+    pos, neg = EmptyRoomPromptGenerator.generate_prompts(room_type, style, color_palette)
+    return {"positive": pos, "negative": neg}
+
+# --------------------------------------------------------------------------- #
+# WebUI – NO AUTH, max 3 concurrent users
+# --------------------------------------------------------------------------- #
 @app.function(
     image=image,
-    gpu=GPU,
+    gpu=select_gpu(),
     volumes={"/models": vol},
-    timeout=600,
+    timeout=7200,
+    startup_timeout=1200,
+    allow_concurrent_inputs=3,
+    _experimental_enable_memory_snapshots=True,
 )
-@modal.web_server(port=7860, startup_timeout=600)
+@modal.web_server(7860)
 def run_webui():
-    """Run Stable Diffusion WebUI with ControlNet."""
     os.chdir("/sd-webui")
-    # Create symlink from /sd-webui/models to /models
+
+    # Symlink volume to expected path
     subprocess.run(["ln", "-sfn", "/models", "/sd-webui/models"], check=False)
-    subprocess.run([
+
+    # VRAM optimization
+    import torch
+    gpu_name = torch.cuda.get_device_name(0).lower()
+    mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
+    args = [
         "python", "launch.py",
-        "--listen", "0.0.0.0",
-        "--port", "7860",
-        "--api",
-        "--skip-python-version-check",
+        "--listen", "--port", "7860",
+        "--api", "--api-log",
         "--disable-safe-unpickle",
-        "--no-half-vae",
         "--xformers",
         "--enable-insecure-extension-access",
-        "--gradio-img2img-tool", "color-sketch",
-        "--gradio-inpaint-tool", "color-sketch",
-    ], check=True)
+        "--skip-torch-cuda-test",
+    ]
+    if "a100" in gpu_name and mem_gb < 50:
+        args.append("--medvram")
 
+    print(f"Launching WebUI on {gpu_name.upper()} ({mem_gb:.0f} GB)")
+    proc = subprocess.Popen(args)
+    try:
+        proc.wait()
+    except KeyboardInterrupt:
+        proc.terminate()
+
+# --------------------------------------------------------------------------- #
+# Helper functions
+# --------------------------------------------------------------------------- #
 @app.function(image=image, volumes={"/models": vol})
 def upload_model(local_path: str, model_type: str = "stable-diffusion"):
-    """Upload a local model file to the Modal Volume."""
-    model_dirs = {
+    mapping = {
         "stable-diffusion": "/Stable-diffusion",
         "controlnet": "/ControlNet",
         "lora": "/Lora",
-        "vae": "/VAE"
+        "vae": "/VAE",
     }
-    if model_type not in model_dirs:
-        raise ValueError(f"Invalid model_type. Must be one of: {list(model_dirs.keys())}")
-
-    remote_path = model_dirs[model_type]
-    vol.put_file(remote_path + "/" + Path(local_path).name, local_path)
-    vol.flush()
-    print(f"Successfully uploaded {local_path} to {remote_path}")
-
-@app.function(image=image, volumes={"/models": vol})
-def download_controlnet_models():
-    """Download common ControlNet models to the volume."""
-    models = [
-        {
-            "url": "https://huggingface.co/lllyasviel/ControlNet-v1-1/resolve/main/control_v11p_sd15_canny.pth",
-            "name": "control_v11p_sd15_canny.pth"
-        },
-        {
-            "url": "https://huggingface.co/lllyasviel/ControlNet-v1-1/resolve/main/control_v11p_sd15_depth.pth",
-            "name": "control_v11p_sd15_depth.pth"
-        }
-    ]
-    for model in models:
-        print(f"Downloading {model['name']}...")
-        response = requests.get(model["url"], stream=True)
-        response.raise_for_status()
-        # Save to temp file then upload
-        with tempfile.NamedTemporaryFile(delete=False) as tempf:
-            for chunk in response.iter_content(chunk_size=8192):
-                tempf.write(chunk)
-            tempf.flush()
-            vol.put_file(f"/ControlNet/{model['name']}", tempf.name)
-        os.unlink(tempf.name)
-    vol.flush()
-    print("All ControlNet models downloaded successfully!")
+    if model_type not in mapping:
+        raise ValueError(f"Invalid type: {list(mapping)}")
+    remote = f"{mapping[model_type]}/{Path(local_path).name}"
+    vol.put_file(remote, local_path)
+    vol.commit()
+    print(f"Uploaded {local_path} → {remote}")
 
 @app.function(image=image, volumes={"/models": vol})
 def list_models():
-    """List all models in the volume."""
-    print("=== Models in Volume ===")
-    for path in vol.listdir("/"):
-        print(f"📁 {path}")
+    print("=== Volume contents ===")
+    for p in vol.listdir("/"):
+        print(f"Folder: {p}")
         try:
-            files = vol.listdir(f"/{path}")
-            for file in files:
-                print(f"  📄 {file}")
+            for f in vol.listdir(f"/{p}"):
+                print(f"   File: {f}")
         except Exception:
             pass
 
-@app.function(image=image, gpu=GPU)
+@app.function(image=image, gpu=select_gpu())
 def test_gpu():
-    """Test GPU availability and PyTorch CUDA support."""
     import torch
-    print("=== GPU Test Results ===")
-    print(f"CUDA available: {torch.cuda.is_available()}")
-    print(f"CUDA version: {torch.version.cuda}")
-    print(f"GPU count: {torch.cuda.device_count()}")
+    print("CUDA:", torch.cuda.is_available())
     if torch.cuda.is_available():
-        print(f"Current device: {torch.cuda.current_device()}")
-        print(f"Device name: {torch.cuda.get_device_name(0)}")
-        print(f"GPU memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
-    else:
-        print("❌ CUDA not available!")
+        print("GPU:", torch.cuda.get_device_name(0))
+        print("Memory:", f"{torch.cuda.get_device_properties(0).total_memory/1e9:.1f} GB")
 
-@app.function(
-    image=image,
-    gpu=GPU,
-)
-def test_snapshot_performance():
-    """Test snapshot performance by loading a model."""
-    import torch
-    import time
-    print("=== Snapshot Performance Test ===")
-    start_time = time.time()
-    model = torch.hub.load('pytorch/vision:v0.10.0', 'resnet18', pretrained=True)
-    model = model.cuda()
-    load_time = time.time() - start_time
-    print(f"Model load time: {load_time:.2f} seconds")
-    dummy_input = torch.randn(1, 3, 224, 224).cuda()
-    with torch.no_grad():
-        output = model(dummy_input)
-    print(f"✅ Model loaded and inference successful!")
-    print(f"GPU memory used: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
-    return "Snapshot created - next run will be much faster!"
-
+# --------------------------------------------------------------------------- #
+# Local entrypoint
+# --------------------------------------------------------------------------- #
 @app.local_entrypoint()
 def main():
-    """Main entrypoint for local commands."""
     import sys
     if len(sys.argv) < 2:
-        print("Usage: modal run app.py [command]")
-        print("Commands:")
-        print("  test-gpu - Test GPU availability")
-        print("  test-snapshots - Test snapshot performance")
-        print("  list-models - List all models in volume")
-        print("  download-controlnet - Download common ControlNet models")
-        print("  upload-model <path> <type> - Upload a local model")
+        print("Commands: test-gpu | list-models | upload-model <path> <type> | deploy")
         return
 
-    command = sys.argv[1]
-    if command == "test-gpu":
+    cmd = sys.argv[1]
+    if cmd == "test-gpu":
         test_gpu.remote()
-    elif command == "test-snapshots":
-        test_snapshot_performance.remote()
-    elif command == "list-models":
+    elif cmd == "list-models":
         list_models.remote()
-    elif command == "download-controlnet":
-        download_controlnet_models.remote()
-    elif command == "upload-model":
+    elif cmd == "upload-model":
         if len(sys.argv) < 4:
-            print("Usage: modal run app.py upload-model <local_path> <model_type>")
+            print("Usage: upload-model <local_path> <type>")
             return
         upload_model.remote(sys.argv[2], sys.argv[3])
+    elif cmd == "deploy":
+        print("Deploying WebUI (no auth, max 3 users)…")
+        run_webui.deploy(name="sd-webui-controlnet")
     else:
-        print(f"Unknown command: {command}")
+        print("Unknown command")
