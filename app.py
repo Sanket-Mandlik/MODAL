@@ -15,50 +15,36 @@ app = modal.App("sd-webui-controlnet")
 vol = modal.Volume.from_name("sd-models", create_if_missing=True)
 
 # --------------------------------------------------------------------------- #
-# GPU: L40S → A100-40 → A100-80
+# GPU: L40S (48GB VRAM)
 # --------------------------------------------------------------------------- #
-def select_gpu():
-    try:
-        out = subprocess.check_output(
-            ["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader"],
-            text=True,
-        )
-    except Exception as e:
-        raise RuntimeError(f"GPU detection failed: {e}")
-
-    for line in out.strip().split("\n"):
-        if not line:
-            continue
-        name, mem = line.split(",", 1)
-        name = name.lower().strip()
-        mem_gb = int(mem.strip().split()[0])
-
-        if "l40s" in name or "ls40" in name:
-            return modal.gpu.L40S(count=1)
-        if "a100" in name:
-            if mem_gb >= 80:
-                return modal.gpu.A100(count=1, memory=80)
-            if mem_gb >= 40:
-                return modal.gpu.A100(count=1, memory=40)
-
-    raise RuntimeError("Only L40S, A100-40GB, A100-80GB allowed.")
+GPU = "L40S"
 
 # --------------------------------------------------------------------------- #
 # Image — proper pip_install, no run_commands for pip
 # --------------------------------------------------------------------------- #
 image = (
-    modal.Image.debian_slim()
-    .apt_install("git", "wget", "curl", "libglib2.0-0", "libsm6", "libxext6", "libxrender1")
-    .pip_install(
-        "torch==2.5.1+cu121",
-        "torchvision==0.20.1+cu121",
-        "--index-url", "https://download.pytorch.org/whl/cu121",
+    modal.Image.debian_slim(python_version="3.11")
+    .apt_install(
+        "git", "wget", "curl", "libglib2.0-0", "libsm6", "libxext6", "libxrender1",
+        "libgl1-mesa-glx", "libglib2.0-0"
+    )
+    .run_commands(
+        "pip install --upgrade pip",
+        "pip install --index-url https://download.pytorch.org/whl/cu121 torch==2.5.1+cu121"
     )
     .pip_install(
-        "gradio", "transformers", "accelerate", "bitsandbytes",
-        "xformers==0.0.26", "opencv-python", "pillow", "numpy",
-        "scipy", "tqdm", "omegaconf", "einops", "controlnet-aux"
+        "torchvision",
+        "gradio==3.41.2", "transformers==4.30.2", "accelerate", "bitsandbytes",
+        "opencv-python", "pillow", "pillow-avif-plugin==1.4.3", "numpy",
+        "scipy", "tqdm", "omegaconf", "einops", "controlnet-aux",
+        "pytorch-lightning==1.9.0", "safetensors", "timm", "kornia",
+        "GitPython", "blendmodes", "clean-fid", "diskcache",
+        "facexlib", "fastapi>=0.90.1", "inflection", "jsonmerge",
+        "lark", "open-clip-torch", "piexif", "protobuf==3.20.0",
+        "psutil", "requests", "resize-right", "scikit-image>=0.19",
+        "tomesd", "torch", "torchdiffeq", "torchsde"
     )
+
     .run_commands(
         "git clone https://github.com/AUTOMATIC1111/stable-diffusion-webui.git /sd-webui",
         "cd /sd-webui && git checkout v1.10.1",  # SDXL
@@ -72,27 +58,26 @@ image = (
 # --------------------------------------------------------------------------- #
 @app.function(
     image=image,
-    gpu=select_gpu(),
+    gpu=GPU,
     volumes={"/models": vol},
     timeout=7200,
     startup_timeout=1200,
-    allow_concurrent_inputs=3,
-    _experimental_enable_memory_snapshots=True,
 )
 @modal.web_server(7860)
 def run_webui():
     os.chdir("/sd-webui")
     subprocess.run(["ln", "-sfn", "/models", "/sd-webui/models"], check=False)
 
+    import torch
     args = [
         "python", "launch.py",
         "--listen", "--port", "7860",
         "--api",
-        "--xformers",
         "--disable-safe-unpickle",
         "--enable-insecure-extension-access",
         "--skip-torch-cuda-test",
-        # NO --medvram
+        "--skip-install",  # Skip installing SD WebUI requirements
+        "--skip-python-version-check",
     ]
 
     print(f"Launching WebUI on {torch.cuda.get_device_name(0)}")
@@ -131,7 +116,7 @@ def list_models():
         except:
             pass
 
-@app.function(image=image, gpu=select_gpu())
+@app.function(image=image, gpu=GPU)
 def test_gpu():
     import torch
     print("CUDA:", torch.cuda.is_available())
