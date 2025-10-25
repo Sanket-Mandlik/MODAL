@@ -36,10 +36,6 @@ image = (
         "git clone https://github.com/AUTOMATIC1111/stable-diffusion-webui.git /sd-webui",
         "cd /sd-webui && git checkout master",
         "cd /sd-webui/extensions && git clone https://github.com/Mikubill/sd-webui-controlnet.git",
-        "mkdir -p /sd-webui/models/Stable-diffusion",
-        "mkdir -p /sd-webui/models/ControlNet",
-        "mkdir -p /sd-webui/models/Lora",
-        "mkdir -p /sd-webui/models/VAE",
         "mkdir -p /sd-webui/embeddings",
         "mkdir -p /sd-webui/outputs",
     )
