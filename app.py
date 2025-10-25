@@ -2,8 +2,6 @@
 import modal
 import subprocess
 import os
-import requests
-import tempfile
 from pathlib import Path
 
 # --------------------------------------------------------------------------- #
@@ -11,7 +9,7 @@ from pathlib import Path
 # --------------------------------------------------------------------------- #
 app = modal.App("sd-webui-controlnet")
 
-# Volume — auto-created
+# Volume — auto-created, persistent
 vol = modal.Volume.from_name("sd-models", create_if_missing=True)
 
 # --------------------------------------------------------------------------- #
@@ -20,7 +18,7 @@ vol = modal.Volume.from_name("sd-models", create_if_missing=True)
 GPU = "L40S"
 
 # --------------------------------------------------------------------------- #
-# Image
+# Image — All dependencies
 # --------------------------------------------------------------------------- #
 image = (
     modal.Image.debian_slim(python_version="3.11")
@@ -59,7 +57,7 @@ image = (
 )
 
 # --------------------------------------------------------------------------- #
-# WebUI — FIXED: @asgi_app(), NO pre-upload
+# WebUI — NO PRE-UPLOAD, MODEL SAVED IN VOLUME AFTER 1ST RUN
 # --------------------------------------------------------------------------- #
 from modal import asgi_app
 
@@ -68,12 +66,17 @@ from modal import asgi_app
     gpu=GPU,
     volumes={"/models": vol},
     timeout=7200,
-    startup_timeout=1200,
+    startup_timeout=1200,  # First run: allow model download
 )
 @asgi_app()
 def run_webui():
     os.chdir("/sd-webui")
-    subprocess.run(["ln", "-sfn", "/models", "/sd-webui/models"], check=False)
+
+    # Ensure WebUI writes directly to volume
+    os.makedirs("/models/Stable-diffusion", exist_ok=True)
+    subprocess.run([
+        "ln", "-sfn", "/models/Stable-diffusion", "/sd-webui/models/Stable-diffusion"
+    ], check=False)
 
     import torch
     args = [
@@ -149,7 +152,7 @@ def main():
             return
         upload_model.remote(sys.argv[2], sys.argv[3])
     elif cmd == "deploy":
-        print("Deploying (no medvram, max 3 users)…")
+        print("Deploying WebUI with ControlNet on L40S...")
         run_webui.deploy(name="sd-webui-controlnet")
     else:
         print("Commands: test-gpu | list-models | upload-model | deploy")
