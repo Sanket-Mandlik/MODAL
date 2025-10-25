@@ -30,7 +30,9 @@ image = (
     )
     .run_commands(
         "pip install --upgrade pip",
-        "pip install --index-url https://download.pytorch.org/whl/cu121 torch==2.5.1+cu121"
+        "pip install --index-url https://download.pytorch.org/whl/cu121 torch==2.5.1+cu121",
+        "pip uninstall -y pydantic pydantic-core",
+        "pip install pydantic==1.10.13"
     )
     .pip_install(
         "torchvision",
@@ -42,7 +44,9 @@ image = (
         "facexlib", "fastapi>=0.90.1", "inflection", "jsonmerge",
         "lark", "open-clip-torch", "piexif", "protobuf==3.20.0",
         "psutil", "requests", "resize-right", "scikit-image>=0.19",
-        "tomesd", "torch", "torchdiffeq", "torchsde"
+        "tomesd", "torch", "torchdiffeq", "torchsde",
+        "ftfy", "regex", "taming-transformers", "clip",
+        "pydantic==1.10.13"
     )
 
     .run_commands(
@@ -50,6 +54,8 @@ image = (
         "cd /sd-webui && git checkout v1.10.1",  # SDXL
         "cd /sd-webui/extensions && git clone https://github.com/Mikubill/sd-webui-controlnet.git",
         "mkdir -p /sd-webui/embeddings /sd-webui/outputs",
+        "pip uninstall -y pydantic pydantic-core",
+        "pip install pydantic==1.10.13"
     )
 )
 
@@ -71,7 +77,8 @@ def run_webui():
     import torch
     args = [
         "python", "launch.py",
-        "--listen", "--port", "7860",
+        "--listen", 
+        "--port", "7860",
         "--api",
         "--disable-safe-unpickle",
         "--enable-insecure-extension-access",
