@@ -20,7 +20,7 @@ vol = modal.Volume.from_name("sd-models", create_if_missing=True)
 GPU = "L40S"
 
 # --------------------------------------------------------------------------- #
-# Image — proper pip_install, no run_commands for pip
+# Image
 # --------------------------------------------------------------------------- #
 image = (
     modal.Image.debian_slim(python_version="3.11")
@@ -48,10 +48,9 @@ image = (
         "ftfy", "regex", "taming-transformers", "clip",
         "pydantic==1.10.13"
     )
-
     .run_commands(
         "git clone https://github.com/AUTOMATIC1111/stable-diffusion-webui.git /sd-webui",
-        "cd /sd-webui && git checkout v1.10.1",  # SDXL
+        "cd /sd-webui && git checkout v1.10.1",
         "cd /sd-webui/extensions && git clone https://github.com/Mikubill/sd-webui-controlnet.git",
         "mkdir -p /sd-webui/embeddings /sd-webui/outputs",
         "pip uninstall -y pydantic pydantic-core",
@@ -60,8 +59,10 @@ image = (
 )
 
 # --------------------------------------------------------------------------- #
-# WebUI — NO medvram, max 3 users
+# WebUI — FIXED: @asgi_app(), NO pre-upload
 # --------------------------------------------------------------------------- #
+from modal import asgi_app
+
 @app.function(
     image=image,
     gpu=GPU,
@@ -69,7 +70,7 @@ image = (
     timeout=7200,
     startup_timeout=1200,
 )
-@modal.web_server(7860)
+@asgi_app()
 def run_webui():
     os.chdir("/sd-webui")
     subprocess.run(["ln", "-sfn", "/models", "/sd-webui/models"], check=False)
@@ -77,25 +78,25 @@ def run_webui():
     import torch
     args = [
         "python", "launch.py",
-        "--listen", 
+        "--listen",
         "--port", "7860",
         "--api",
         "--disable-safe-unpickle",
         "--enable-insecure-extension-access",
         "--skip-torch-cuda-test",
-        "--skip-install",  # Skip installing SD WebUI requirements
+        "--skip-install",
         "--skip-python-version-check",
+        "--opt-sdp-attention",
+        "--no-half-vae",
+        "--medvram",
     ]
 
     print(f"Launching WebUI on {torch.cuda.get_device_name(0)}")
     proc = subprocess.Popen(args)
-    try:
-        proc.wait()
-    except KeyboardInterrupt:
-        proc.terminate()
+    proc.wait()
 
 # --------------------------------------------------------------------------- #
-# Helper Functions
+# Helper Functions — ALL KEPT
 # --------------------------------------------------------------------------- #
 @app.function(image=image, volumes={"/models": vol})
 def upload_model(local_path: str, model_type: str = "stable-diffusion"):
@@ -132,7 +133,7 @@ def test_gpu():
         print("Memory:", f"{torch.cuda.get_device_properties(0).total_memory/1e9:.1f} GB")
 
 # --------------------------------------------------------------------------- #
-# Local Entrypoint
+# Local Entrypoint — KEPT
 # --------------------------------------------------------------------------- #
 @app.local_entrypoint()
 def main():
