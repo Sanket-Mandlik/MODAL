@@ -24,23 +24,8 @@ image = (
         "python --version",
         "pip --version",
         "pip install --upgrade pip --break-system-packages",
-        "pip install --index-url https://download.pytorch.org/whl/cu121 torch==2.5.1+cu121 torchvision --break-system-packages"
-    )
-    .pip_install(
-        # Core dependencies
-        "gradio",
-        "transformers",
-        "accelerate",
-        "bitsandbytes",
-        "xformers",
-        "opencv-python",
-        "pillow",
-        "numpy",
-        "scipy",
-        "tqdm",
-        "omegaconf",
-        "einops",
-        "controlnet-aux",
+        "pip install --index-url https://download.pytorch.org/whl/cu121 torch==2.5.1+cu121 torchvision --break-system-packages",
+        "pip install gradio transformers accelerate bitsandbytes xformers opencv-python pillow numpy scipy tqdm omegaconf einops controlnet-aux --break-system-packages"
     )
     .run_commands(
         "git clone https://github.com/AUTOMATIC1111/stable-diffusion-webui.git /sd-webui",
@@ -51,8 +36,8 @@ image = (
     )
 )
 
-# Use L4 GPU - good balance of performance and cost for SD WebUI
-GPU = "L4"
+# Use LS40 GPU (48GB VRAM, more cost effective than multiple A100s)
+GPU = "LS40"
 
 @app.function(
     image=image,
