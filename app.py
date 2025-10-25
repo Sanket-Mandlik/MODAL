@@ -14,8 +14,18 @@ vol = modal.Volume.from_name("sd-models", create_if_missing=True)
 # Build the container image with dependencies
 image = (
     modal.Image.debian_slim()
-    .apt_install("git", "wget", "curl")
-    .run_commands("pip install --index-url https://download.pytorch.org/whl/cu121 torch==2.5.1+cu121 torchvision")
+    .apt_install("git", "wget", "curl", "python3.11", "python3.11-venv", "python3.11-dev", "python3-pip", "build-essential")
+    .run_commands(
+        "rm -f /usr/local/bin/python /usr/local/bin/python3 /usr/local/bin/pip /usr/local/bin/pip3",
+        "ln -s /usr/bin/python3.11 /usr/local/bin/python",
+        "ln -s /usr/bin/python3.11 /usr/local/bin/python3",
+        "ln -s /usr/bin/pip3 /usr/local/bin/pip",
+        "ln -s /usr/bin/pip3 /usr/local/bin/pip3",
+        "python --version",
+        "pip --version",
+        "pip install --upgrade pip --break-system-packages",
+        "pip install --index-url https://download.pytorch.org/whl/cu121 torch==2.5.1+cu121 torchvision --break-system-packages"
+    )
     .pip_install(
         # Core dependencies
         "gradio",
@@ -47,18 +57,21 @@ GPU = "L4"
 @app.function(
     image=image,
     gpu=GPU,
-    volumes={"/sd-webui/models": vol},
+    volumes={"/models": vol},
     timeout=600,
 )
 @modal.web_server(port=7860, startup_timeout=600)
 def run_webui():
     """Run Stable Diffusion WebUI with ControlNet."""
     os.chdir("/sd-webui")
+    # Create symlink from /sd-webui/models to /models
+    subprocess.run(["ln", "-sfn", "/models", "/sd-webui/models"], check=False)
     subprocess.run([
         "python", "launch.py",
         "--listen", "0.0.0.0",
         "--port", "7860",
         "--api",
+        "--skip-python-version-check",
         "--disable-safe-unpickle",
         "--no-half-vae",
         "--xformers",
@@ -67,7 +80,7 @@ def run_webui():
         "--gradio-inpaint-tool", "color-sketch",
     ], check=True)
 
-@app.function(image=image, volumes={"/sd-webui/models": vol})
+@app.function(image=image, volumes={"/models": vol})
 def upload_model(local_path: str, model_type: str = "stable-diffusion"):
     """Upload a local model file to the Modal Volume."""
     model_dirs = {
@@ -84,7 +97,7 @@ def upload_model(local_path: str, model_type: str = "stable-diffusion"):
     vol.flush()
     print(f"Successfully uploaded {local_path} to {remote_path}")
 
-@app.function(image=image, volumes={"/sd-webui/models": vol})
+@app.function(image=image, volumes={"/models": vol})
 def download_controlnet_models():
     """Download common ControlNet models to the volume."""
     models = [
@@ -111,7 +124,7 @@ def download_controlnet_models():
     vol.flush()
     print("All ControlNet models downloaded successfully!")
 
-@app.function(image=image, volumes={"/sd-webui/models": vol})
+@app.function(image=image, volumes={"/models": vol})
 def list_models():
     """List all models in the volume."""
     print("=== Models in Volume ===")
