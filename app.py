@@ -1,7 +1,7 @@
+# app.py
 import modal
 import subprocess
 import os
-import time
 from pathlib import Path
 
 # --------------------------------------------------------------------------- #
@@ -9,7 +9,7 @@ from pathlib import Path
 # --------------------------------------------------------------------------- #
 app = modal.App("sd-webui-controlnet")
 
-# Persistent volume — models go directly into A1111's model path
+# Persistent volume
 vol = modal.Volume.from_name("sd-models", create_if_missing=True)
 
 # GPU
@@ -31,10 +31,15 @@ image = (
         "pip install pydantic==1.10.13"
     )
     .pip_install(
+        # Core
         "gradio==3.41.2", "transformers==4.30.2", "accelerate", "bitsandbytes",
         "opencv-python", "pillow", "pillow-avif-plugin==1.4.3", "numpy",
         "scipy", "tqdm", "omegaconf", "einops",
+
+        # ControlNet & Preprocessors
         "controlnet-aux", "facexlib", "gfpgan",
+
+        # Others
         "pytorch-lightning==1.9.0", "safetensors", "timm", "kornia",
         "GitPython", "blendmodes", "clean-fid", "diskcache",
         "fastapi>=0.90.1", "inflection", "jsonmerge",
@@ -48,33 +53,98 @@ image = (
         "cd /sd-webui && git checkout v1.10.1",
         "cd /sd-webui/extensions && git clone https://github.com/Mikubill/sd-webui-controlnet.git",
         "mkdir -p /sd-webui/embeddings /sd-webui/outputs"
-        # DO NOT create /sd-webui/models here to avoid volume mounting conflicts
     )
 )
 
 # --------------------------------------------------------------------------- #
-# WebUI — Direct Volume Mount + No Symlinks
+# WebUI — PROXY + NO BLOCKING
 # --------------------------------------------------------------------------- #
+from modal import asgi_app
+
 @app.function(
     image=image,
     gpu=GPU,
-    volumes={"/sd-webui/models": vol},  # Direct mount into A1111's model directory
+    volumes={"/models": vol},
     timeout=7200,
     startup_timeout=1800,
 )
-@modal.asgi_app()
+@asgi_app()
 def run_webui():
     os.chdir("/sd-webui")
 
-    model_path = Path("/sd-webui/models/Stable-diffusion/v1-5-pruned-emaonly.safetensors")
+    # === Volume & Symlink Setup ===
+    vol_dir = Path("/models/Stable-diffusion")
+    webui_dir = Path("/sd-webui/models/Stable-diffusion")
+    vol_dir.mkdir(parents=True, exist_ok=True)
 
-    if not model_path.exists():
-        raise RuntimeError(f"Model file not found: {model_path}")
+    print(f"[DEBUG] Volume mount: /models")
+    print(f"[DEBUG] Volume dir exists: {vol_dir.exists()}")
+    print(f"[DEBUG] WebUI dir exists: {webui_dir.exists()}")
 
-    print(f"Model ready: {model_path} ({model_path.stat().st_size / 1e9:.2f} GB)")
+    # List files in volume
+    try:
+        files = [p.name for p in vol_dir.iterdir()]
+        print(f"[DEBUG] Files in /models/Stable-diffusion: {files}")
+    except Exception as e:
+        print(f"[DEBUG] Could not list volume dir: {e}")
 
-    print("Launching WebUI (L40S 48GB — full speed)...")
-    proc = subprocess.Popen([
+    # Clean up old real directory if exists
+    if webui_dir.exists() and not webui_dir.is_symlink():
+        print(f"[CLEANUP] Removing old real directory: {webui_dir}")
+        import shutil
+        shutil.rmtree(webui_dir, ignore_errors=True)
+
+    # Always (re)create symlink
+    if not webui_dir.is_symlink():
+        print(f"[SYMLINK] Creating: {vol_dir} → {webui_dir}")
+        try:
+            os.symlink(vol_dir, webui_dir)
+            print("[SYMLINK] Success")
+        except Exception as e:
+            print(f"[SYMLINK] Failed: {e}")
+            raise
+    else:
+        target = os.readlink(webui_dir)
+        print(f"[SYMLINK] Already exists → {target}")
+
+    # === Download model once ===
+    model_name = "v1-5-pruned-emaonly.safetensors"
+    model_path = vol_dir / model_name
+
+    print(f"[MODEL] Checking: {model_path}")
+
+    if model_path.exists():
+        size_gb = model_path.stat().st_size / (1024**3)
+        print(f"[MODEL] FOUND: {model_name} ({size_gb:.2f} GB) → Skipping download")
+    else:
+        print(f"[MODEL] NOT FOUND → Downloading {model_name}...")
+        import urllib.request
+        from tqdm import tqdm
+
+        url = "https://huggingface.co/runwayml/stable-diffusion-v1-5/resolve/main/v1-5-pruned-emaonly.safetensors"
+        try:
+            with urllib.request.urlopen(url) as r, open(model_path, "wb") as f:
+                total = int(r.headers.get("content-length", 0))
+                with tqdm(total=total, unit="iB", unit_scale=True, desc="Download") as pbar:
+                    while True:
+                        chunk = r.read(1024*1024)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        pbar.update(len(chunk))
+            print("[MODEL] Download complete")
+        except Exception as e:
+            print(f"[MODEL] Download failed: {e}")
+            if model_path.exists():
+                model_path.unlink()
+            raise
+        finally:
+            vol.commit()
+            print("[VOLUME] Commit complete")
+
+    # === Start WebUI ===
+    print("Starting WebUI on port 7860...")
+    subprocess.Popen([
         "python", "launch.py",
         "--listen", "--port", "7860", "--api",
         "--disable-safe-unpickle", "--enable-insecure-extension-access",
@@ -82,21 +152,7 @@ def run_webui():
         "--opt-sdp-attention", "--no-half-vae", "--medvram"
     ])
 
-    import requests
-    def wait_for_api():
-        print("Waiting for WebUI API to start...", end="")
-        for _ in range(60):
-            try:
-                r = requests.get("http://localhost:7860/sdapi/v1/sd-models", timeout=5)
-                if r.status_code == 200:
-                    print(" READY!")
-                    return
-            except:
-                print(".", end="", flush=True)
-                time.sleep(3)
-        raise RuntimeError("WebUI failed to start after 3 minutes")
-    wait_for_api()
-
+    # === FastAPI Proxy ===
     from fastapi import FastAPI, Request
     import httpx
 
@@ -104,22 +160,13 @@ def run_webui():
 
     @web_app.get("/")
     async def root():
-        return {
-            "message": "A1111 Stable Diffusion WebUI + ControlNet",
-            "api": "/sdapi/v1/txt2img",
-            "ui": "Gradio UI ready",
-            "model": str(model_path.name)
-        }
-
-    @web_app.get("/health")
-    async def health():
-        return {"status": "healthy"}
+        return {"message": "WebUI starting... wait 30s", "controlnet": "READY"}
 
     async def proxy(request: Request):
         url = f"http://localhost:7860{request.url.path}"
         if request.url.query:
             url += f"?{request.url.query}"
-        client = httpx.AsyncClient(timeout=120.0)
+        client = httpx.AsyncClient(timeout=60.0)
         try:
             req = client.build_request(
                 request.method, url,
@@ -132,56 +179,50 @@ def run_webui():
             await client.aclose()
 
     web_app.add_route("/{path:path}", proxy, methods=["*"])
-
     return web_app
 
 # --------------------------------------------------------------------------- #
-# Helper: Upload model (optional)
+# Helpers
 # --------------------------------------------------------------------------- #
-@app.function(image=image, volumes={"/sd-webui/models": vol})
-def upload_model(local_path: str, model_type: str = "Stable-diffusion"):
+@app.function(image=image, volumes={"/models": vol})
+def upload_model(local_path: str, model_type: str = "stable-diffusion"):
     mapping = {
-        "stable-diffusion": "/sd-webui/models/Stable-diffusion",
-        "controlnet": "/sd-webui/models/ControlNet",
-        "lora": "/sd-webui/models/Lora",
-        "vae": "/sd-webui/models/VAE",
+        "stable-diffusion": "/Stable-diffusion",
+        "controlnet": "/ControlNet",
+        "lora": "/Lora",
+        "vae": "/VAE",
     }
     if model_type not in mapping:
-        raise ValueError(f"Invalid model type, supported: {list(mapping)}")
-    remote_dir = Path(mapping[model_type])
-    remote_dir.mkdir(parents=True, exist_ok=True)
-    vol.put_file(str(remote_dir / Path(local_path).name), local_path)
+        raise ValueError(f"Invalid type: {list(mapping)}")
+    remote = f"{mapping[model_type]}/{Path(local_path).name}"
+    vol.put_file(remote, local_path)
     vol.commit()
-    print(f"Uploaded {local_path} → {remote_dir / Path(local_path).name}")
+    print(f"Uploaded {local_path} → {remote}")
 
-# --------------------------------------------------------------------------- #
-# Helper: List models
-# --------------------------------------------------------------------------- #
-@app.function(image=image, volumes={"/sd-webui/models": vol})
+@app.function(image=image, volumes={"/models": vol})
 def list_models():
-    print("=== Persistent Volume Contents ===")
-    for p in vol.listdir("/sd-webui/models"):
-        print(f"Folder: {p.path}")
-        try:
-            for f in vol.listdir(p.path):
-                size = f.size / 1e9 if f.size else 0
-                print(f"  File: {f.path} ({size:.2f} GB)")
-        except:
-            pass
+    print("=== Volume Contents ===")
+    try:
+        for p in vol.listdir("/"):
+            print(f"Folder: {p.path}")
+            try:
+                for f in vol.listdir(p.path):
+                    print(f"  File: {f.path} ({f.size / (1024**3):.2f} GB)")
+            except:
+                pass
+    except Exception as e:
+        print(f"Error listing volume: {e}")
 
-# --------------------------------------------------------------------------- #
-# Helper: Test GPU
-# --------------------------------------------------------------------------- #
 @app.function(image=image, gpu=GPU)
 def test_gpu():
     import torch
     print("CUDA:", torch.cuda.is_available())
     if torch.cuda.is_available():
         print("GPU:", torch.cuda.get_device_name(0))
-        print(f"VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+        print("VRAM:", f"{torch.cuda.get_device_properties(0).total_memory/1e9:.1f} GB")
 
 # --------------------------------------------------------------------------- #
-# Local Entrypoint
+# Local entrypoint
 # --------------------------------------------------------------------------- #
 @app.local_entrypoint()
 def main():
@@ -201,7 +242,6 @@ def main():
         upload_model.remote(sys.argv[2], sys.argv[3])
     elif cmd == "deploy":
         run_webui.deploy(name="sd-webui-controlnet")
-        print("Deployed! URL: https://your-workspace--sd-webui-controlnet.modal.run")
     elif cmd == "serve":
         print("Starting... URL in ~30s")
         run_webui.serve()
