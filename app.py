@@ -15,11 +15,8 @@ vol = modal.Volume.from_name("sd-models", create_if_missing=True)
 image = (
     modal.Image.debian_slim()
     .apt_install("git", "wget", "curl")
+    .run_commands("pip install --index-url https://download.pytorch.org/whl/cu121 torch==2.5.1+cu121 torchvision")
     .pip_install(
-        # PyTorch with CUDA 11.8 for Modal
-        "torch==2.3.0",
-        "torchvision==0.18.0",
-        "--extra-index-url", "https://download.pytorch.org/whl/cu118",
         # Core dependencies
         "gradio",
         "transformers",
@@ -48,31 +45,14 @@ image = (
     )
 )
 
-def choose_gpu():
-    # Try H100 first, then LS40 as fallback
-    preferred_gpus = ["h100", "ls40"]
-    available_gpu = None
-    try:
-        output = subprocess.check_output(
-            ['nvidia-smi', '--query-gpu=name', '--format=csv,noheader'], text=True)
-        names = [line.strip().lower() for line in output.strip().split('\n')]
-        for gpu in preferred_gpus:
-            if any(gpu in name for name in names):
-                available_gpu = gpu.upper()
-                break
-    except Exception as e:
-        print(f"Could not query GPU: {e}")
-    return available_gpu or "A10G"  # Default fallback
-
-SELECTED_GPU = choose_gpu()
+# Use L4 GPU - good balance of performance and cost for SD WebUI
+GPU = "L4"
 
 @app.function(
     image=image,
-    gpu=SELECTED_GPU,  # This will pick H100, then LS40, then fallback (A10G)
+    gpu=GPU,
     volumes={"/sd-webui/models": vol},
     timeout=600,
-    allow_concurrent_inputs=1,
-    _experimental_enable_memory_snapshots=True,
 )
 @modal.web_server(port=7860, startup_timeout=600)
 def run_webui():
@@ -148,7 +128,7 @@ def list_models():
         except Exception:
             pass
 
-@app.function(image=image, gpu=SELECTED_GPU)
+@app.function(image=image, gpu=GPU)
 def test_gpu():
     """Test GPU availability and PyTorch CUDA support."""
     import torch
@@ -165,8 +145,7 @@ def test_gpu():
 
 @app.function(
     image=image,
-    gpu=SELECTED_GPU,
-    _experimental_enable_memory_snapshots=True,
+    gpu=GPU,
 )
 def test_snapshot_performance():
     """Test snapshot performance by loading a model."""
