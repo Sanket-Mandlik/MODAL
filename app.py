@@ -144,41 +144,89 @@ def run_webui():
 
     # === Start WebUI ===
     print("Starting WebUI on port 7860...")
-    subprocess.Popen([
+    
+    # CRITICAL: Disable ControlNet hashing
+    env = os.environ.copy()
+    env["CONTROLNET_NO_MODEL_HASH"] = "1"
+    
+    # Start WebUI process
+    webui_process = subprocess.Popen([
         "python", "launch.py",
         "--listen", "--port", "7860", "--api",
         "--disable-safe-unpickle", "--enable-insecure-extension-access",
         "--skip-torch-cuda-test", "--skip-install", "--skip-python-version-check",
-        "--opt-sdp-attention", "--no-half-vae", "--medvram"
-    ])
+        "--opt-sdp-attention", "--no-half-vae", "--medvram",
+        "--disable-model-loading-ram-optimization",
+        "--no-hashing"  # ← ADD THIS: Disables ALL hashing (A1111 + ControlNet)
+    ], env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
 
     # === FastAPI Proxy ===
-    from fastapi import FastAPI, Request
+    from fastapi import FastAPI, Request, HTTPException
     import httpx
+    import asyncio
+    import time
 
     web_app = FastAPI()
+    webui_ready = False
+
+    async def wait_for_webui():
+        """Wait for WebUI to be ready"""
+        global webui_ready
+        max_wait = 300  # 5 minutes max
+        start_time = time.time()
+        
+        while time.time() - start_time < max_wait:
+            try:
+                async with httpx.AsyncClient(timeout=5.0) as client:
+                    response = await client.get("http://localhost:7860")
+                    if response.status_code == 200:
+                        print("[WEBUI] Ready!")
+                        webui_ready = True
+                        return True
+            except Exception as e:
+                print(f"[WEBUI] Not ready yet: {e}")
+                await asyncio.sleep(5)
+        
+        print("[WEBUI] Timeout waiting for startup")
+        return False
 
     @web_app.get("/")
     async def root():
-        return {"message": "WebUI starting... wait 30s", "controlnet": "READY"}
+        if not webui_ready:
+            return {"message": "WebUI starting... please wait", "status": "starting"}
+        return {"message": "WebUI ready", "status": "ready"}
+
+    @web_app.get("/health")
+    async def health():
+        if not webui_ready:
+            raise HTTPException(status_code=503, detail="WebUI not ready")
+        return {"status": "healthy"}
 
     async def proxy(request: Request):
+        if not webui_ready:
+            raise HTTPException(status_code=503, detail="WebUI not ready")
+        
         url = f"http://localhost:7860{request.url.path}"
         if request.url.query:
             url += f"?{request.url.query}"
-        client = httpx.AsyncClient(timeout=60.0)
-        try:
-            req = client.build_request(
-                request.method, url,
-                headers=request.headers,
-                content=await request.body()
-            )
-            resp = await client.send(req, stream=True)
-            return resp
-        finally:
-            await client.aclose()
+        
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            try:
+                req = client.build_request(
+                    request.method, url,
+                    headers=request.headers,
+                    content=await request.body()
+                )
+                resp = await client.send(req, stream=True)
+                return resp
+            except httpx.ConnectError:
+                raise HTTPException(status_code=503, detail="WebUI not available")
 
     web_app.add_route("/{path:path}", proxy, methods=["*"])
+    
+    # Start background task to wait for WebUI
+    asyncio.create_task(wait_for_webui())
+    
     return web_app
 
 # --------------------------------------------------------------------------- #
