@@ -66,7 +66,7 @@ import modal
     image=sd_webui_image,          # Snapshot – build once, reuse forever
     gpu=GPU,                       # L40S GPU
     volumes={"/models": vol},      # Persistent models
-    timeout=60,                 # 20 minutes - allow for image generation + response
+    timeout=600,                 # 10 minutes - allow for image generation + response
     startup_timeout=1800,         # BUILD/STARTUP CAN TAKE 30 MIN
     scaledown_window=5,        # Keep alive for 30 seconds after request
 )
@@ -152,7 +152,7 @@ def run_webui():
         "--opt-sdp-attention", "--no-half-vae", "--medvram",
         "--disable-model-loading-ram-optimization",
         "--no-hashing"
-    ], env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=0)
+    ], env=env, stdout=None, stderr=None)  # Don't capture output - let it go directly to Modal logs
     
     print(f"[WEBUI] Process started with PID: {webui_process.pid}")
 
@@ -220,20 +220,16 @@ def run_webui():
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        print("[STARTUP] Starting WebUI health check...")
-        output_task = asyncio.create_task(monitor_webui_output())
+        # Startup
+        print("[STARTUP] Waiting for WebUI to be ready...")
         await wait_for_webui()
         print("[STARTUP] FastAPI app ready!")
         
         try:
             yield
         finally:
+            # Shutdown
             print("[SHUTDOWN] Cleaning up...")
-            output_task.cancel()
-            try:
-                await output_task
-            except asyncio.CancelledError:
-                pass
             if webui_process.poll() is None:
                 print("[SHUTDOWN] Terminating WebUI process...")
                 webui_process.terminate()
@@ -250,7 +246,14 @@ def run_webui():
         global webui_ready
         if not webui_ready:
             raise HTTPException(status_code=503, detail="WebUI not ready")
-        return {"status": "healthy"}
+        
+        # Actually check if WebUI API is responding
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as test_client:
+                test_resp = await test_client.get("http://localhost:7860/sdapi/v1/progress")
+                return {"status": "healthy", "webui_api_responding": test_resp.status_code == 200}
+        except:
+            return {"status": "healthy", "webui_api_responding": False}
 
     async def proxy(request: Request):
         global webui_ready
@@ -278,39 +281,27 @@ def run_webui():
                     
                     # Get request body
                     body_data = await request.body()
+                    
                     print(f"[PROXY] Request body size: {len(body_data)} bytes")
                     
-                    # Use the correct HTTP method
+                    # Build request exactly as the original working code did
                     req = client.build_request(
                         request.method, url,
                         headers={k: v for k, v in request.headers.items() if k.lower() not in ['host', 'content-length']},
                         content=body_data
                     )
                     
-                    print(f"[PROXY] Sending request to WebUI with streaming...")
+                    print(f"[PROXY] Sending to WebUI...")
                     try:
-                        # Use streaming=True to read response as it comes
-                        resp = await client.send(req, stream=True)
-                        print(f"[PROXY] Response received: {resp.status_code}, headers: {dict(resp.headers)}")
-                    except httpx.ReadTimeout as e:
-                        print(f"[PROXY] ERROR: Read timeout - {e}")
-                        raise HTTPException(status_code=504, detail="Request to WebUI timed out")
+                        resp = await client.send(req, stream=False)
+                        print(f"[PROXY] Got response: {resp.status_code}, size: {len(resp.content) if resp.content else 0} bytes")
                     except Exception as e:
-                        print(f"[PROXY] ERROR sending request: {e}")
+                        print(f"[PROXY] Error: {e}")
+                        import traceback
+                        traceback.print_exc()
                         raise
                     
-                    # Collect all chunks from the streaming response
-                    print(f"[PROXY] Reading response content in chunks...")
-                    chunks = []
-                    total_size = 0
-                    async for chunk in resp.aiter_bytes(chunk_size=65536):  # Read in 64KB chunks
-                        chunks.append(chunk)
-                        total_size += len(chunk)
-                        print(f"[PROXY] Received chunk: {len(chunk)} bytes (total: {total_size} bytes)")
-                    
-                    # Combine all chunks
-                    content = b''.join(chunks)
-                    print(f"[PROXY] Total response content: {len(content)} bytes")
+                    content = resp.content
                     
                     # For debugging, verify the response contains base64 image data
                     if content:
@@ -333,12 +324,6 @@ def run_webui():
                         except Exception as e:
                             print(f"[PROXY] Response is not valid JSON: {e}")
                             print(f"[PROXY] First 100 bytes: {content[:100]}")
-                    
-                    # Close the response
-                    try:
-                        await resp.aclose()
-                    except:
-                        pass
                     
                     # Filter problematic headers and add content-length
                     filtered_headers = {}
