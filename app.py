@@ -60,14 +60,17 @@ image = (
 # WebUI — PROXY + NO BLOCKING
 # --------------------------------------------------------------------------- #
 from modal import asgi_app
+import modal
 
 @app.function(
     image=image,
     gpu=GPU,
     volumes={"/models": vol},
-    timeout=180,
+    timeout=3600,  # 1 hour - prevent frequent restarts
     startup_timeout=1800,
+    scaledown_window=300,  # Keep alive for 5 minutes (new name)
 )
+@modal.concurrent(max_inputs=1)  # Prevent multiple instances
 @asgi_app()
 def run_webui():
     os.chdir("/sd-webui")
@@ -110,6 +113,17 @@ def run_webui():
     # === Check for models in volume ===
     print(f"[MODEL] Checking volume for models...")
     
+    # Clean up partial downloads
+    try:
+        partial_files = list(vol_dir.glob("*.partial"))
+        if partial_files:
+            print(f"[CLEANUP] Removing {len(partial_files)} partial download(s)...")
+            for partial_file in partial_files:
+                partial_file.unlink()
+                print(f"  Removed: {partial_file.name}")
+    except Exception as e:
+        print(f"[CLEANUP] Error removing partial files: {e}")
+    
     try:
         model_files = list(vol_dir.glob("*.safetensors")) + list(vol_dir.glob("*.ckpt"))
         if model_files:
@@ -136,7 +150,6 @@ def run_webui():
     webui_process = subprocess.Popen([
         "python", "-u", "launch.py",  # -u flag for unbuffered output
         "--listen", "--port", "7860", "--api",
-        "--share",
         "--disable-safe-unpickle", "--enable-insecure-extension-access",
         "--skip-torch-cuda-test", "--skip-install", "--skip-python-version-check",
         "--opt-sdp-attention", "--no-half-vae", "--medvram",
@@ -216,21 +229,30 @@ def run_webui():
     async def lifespan(app: FastAPI):
         # Startup
         print("[STARTUP] Starting WebUI health check...")
-        asyncio.create_task(monitor_webui_output())
+        output_task = asyncio.create_task(monitor_webui_output())
         # Wait for WebUI to be ready
         await wait_for_webui()
         print("[STARTUP] FastAPI app ready!")
-        yield
-        # Shutdown
-        print("[SHUTDOWN] Cleaning up...")
-        if webui_process.poll() is None:
-            print("[SHUTDOWN] Terminating WebUI process...")
-            webui_process.terminate()
+        
+        # Keep monitoring task running
+        try:
+            yield
+        finally:
+            # Shutdown
+            print("[SHUTDOWN] Cleaning up...")
+            output_task.cancel()
             try:
-                webui_process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                print("[SHUTDOWN] Force killing WebUI process...")
-                webui_process.kill()
+                await output_task
+            except asyncio.CancelledError:
+                pass
+            if webui_process.poll() is None:
+                print("[SHUTDOWN] Terminating WebUI process...")
+                webui_process.terminate()
+                try:
+                    webui_process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    print("[SHUTDOWN] Force killing WebUI process...")
+                    webui_process.kill()
 
     web_app = FastAPI(lifespan=lifespan)
 
@@ -254,34 +276,68 @@ def run_webui():
         print(f"[PROXY] {request.method} {request.url.path} -> {url}")
         
         try:
-            async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
-                req = client.build_request(
-                    request.method, url,
-                    headers={k: v for k, v in request.headers.items() if k.lower() not in ['host', 'content-length']},
-                    content=await request.body()
-                )
-                resp = await client.send(req, stream=True)
-                
-                # Wrap stream with proper cleanup
-                async def stream_generator():
-                    try:
-                        async for chunk in resp.aiter_bytes():
-                            yield chunk
-                    finally:
-                        # Ensure cleanup
-                        if hasattr(resp, 'aclose'):
-                            try:
-                                await resp.aclose()
-                            except:
-                                pass
-                
-                from fastapi.responses import StreamingResponse
-                return StreamingResponse(
-                    stream_generator(),
-                    status_code=resp.status_code,
-                    headers={k: v for k, v in resp.headers.items() if k.lower() not in ['transfer-encoding', 'content-encoding']},
-                    media_type=resp.headers.get("content-type")
-                )
+            # Increased timeout for image generation POST requests
+            timeout = httpx.Timeout(60.0, connect=10.0, read=600.0, write=60.0, pool=10.0)
+            async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+                # For ALL requests (GET, POST, etc), fetch full response (not streaming)
+                # This ensures we get the complete response without ReadError
+                if request.method in ["GET", "POST", "PUT", "PATCH"]:
+                    print(f"[PROXY] Fetching full response for {request.method} {request.url.path}")
+                    # Use the correct HTTP method
+                    req = client.build_request(
+                        request.method, url,
+                        headers={k: v for k, v in request.headers.items() if k.lower() not in ['host', 'content-length']},
+                        content=await request.body()
+                    )
+                    resp = await client.send(req, stream=False)
+                    print(f"[PROXY] Got response: {resp.status_code}, size: {len(resp.content) if resp.content else 0} bytes")
+                    
+                    from fastapi.responses import Response
+                    # Filter problematic headers and add content-length
+                    filtered_headers = {}
+                    for k, v in resp.headers.items():
+                        if k.lower() not in ['transfer-encoding', 'content-encoding', 'connection']:
+                            filtered_headers[k] = v
+                    # Explicitly set content-length for proper response
+                    filtered_headers['content-length'] = str(len(resp.content))
+                    return Response(
+                        content=resp.content,
+                        status_code=resp.status_code,
+                        headers=filtered_headers,
+                        media_type=resp.headers.get("content-type")
+                    )
+                else:
+                    # For other requests, use streaming
+                    req = client.build_request(
+                        request.method, url,
+                        headers={k: v for k, v in request.headers.items() if k.lower() not in ['host', 'content-length']},
+                        content=await request.body()
+                    )
+                    resp = await client.send(req, stream=True)
+                    
+                    # Wrap stream with proper cleanup
+                    async def stream_generator():
+                        try:
+                            async for chunk in resp.aiter_bytes(chunk_size=8192):
+                                yield chunk
+                        except httpx.ReadError as e:
+                            print(f"[PROXY] ReadError during streaming: {e}")
+                            # Don't raise, just end the stream gracefully
+                        finally:
+                            # Ensure cleanup
+                            if hasattr(resp, 'aclose'):
+                                try:
+                                    await resp.aclose()
+                                except:
+                                    pass
+                    
+                    from fastapi.responses import StreamingResponse
+                    return StreamingResponse(
+                        stream_generator(),
+                        status_code=resp.status_code,
+                        headers={k: v for k, v in resp.headers.items() if k.lower() not in ['transfer-encoding', 'content-encoding']},
+                        media_type=resp.headers.get("content-type")
+                    )
         except httpx.ConnectError as e:
             print(f"[PROXY] ConnectError: {e}")
             raise HTTPException(status_code=503, detail="WebUI not available")
@@ -289,9 +345,9 @@ def run_webui():
             print(f"[PROXY] Error: {e}")
             raise HTTPException(status_code=500, detail=str(e))
 
-    # Add root route and catch-all proxy
-    web_app.add_route("/", proxy, methods=["*"])
-    web_app.add_route("/{path:path}", proxy, methods=["*"])
+    # Catch-all proxy route
+    web_app.add_route("/{full_path:path}", proxy, methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"])
+    web_app.api_route("/", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"])(proxy)
     
     return web_app
 
