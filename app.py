@@ -136,6 +136,7 @@ def run_webui():
     webui_process = subprocess.Popen([
         "python", "-u", "launch.py",  # -u flag for unbuffered output
         "--listen", "--port", "7860", "--api",
+        "--share",
         "--disable-safe-unpickle", "--enable-insecure-extension-access",
         "--skip-torch-cuda-test", "--skip-install", "--skip-python-version-check",
         "--opt-sdp-attention", "--no-half-vae", "--medvram",
@@ -215,8 +216,10 @@ def run_webui():
     async def lifespan(app: FastAPI):
         # Startup
         print("[STARTUP] Starting WebUI health check...")
-        asyncio.create_task(wait_for_webui())
         asyncio.create_task(monitor_webui_output())
+        # Wait for WebUI to be ready
+        await wait_for_webui()
+        print("[STARTUP] FastAPI app ready!")
         yield
         # Shutdown
         print("[SHUTDOWN] Cleaning up...")
@@ -233,17 +236,20 @@ def run_webui():
 
     @web_app.get("/")
     async def root():
+        global webui_ready
         if not webui_ready:
             return {"message": "WebUI starting... please wait", "status": "starting"}
         return {"message": "WebUI ready", "status": "ready"}
 
     @web_app.get("/health")
     async def health():
+        global webui_ready
         if not webui_ready:
             raise HTTPException(status_code=503, detail="WebUI not ready")
         return {"status": "healthy"}
 
     async def proxy(request: Request):
+        global webui_ready
         if not webui_ready:
             raise HTTPException(status_code=503, detail="WebUI not ready")
         
@@ -254,8 +260,8 @@ def run_webui():
         
         print(f"[PROXY] {request.method} {request.url.path} -> {url}")
         
-        async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
-            try:
+        try:
+            async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
                 req = client.build_request(
                     request.method, url,
                     headers={k: v for k, v in request.headers.items() if k.lower() not in ['host', 'content-length']},
@@ -263,20 +269,32 @@ def run_webui():
                 )
                 resp = await client.send(req, stream=True)
                 
-                # Return streaming response with proper headers
+                # Wrap stream with proper cleanup
+                async def stream_generator():
+                    try:
+                        async for chunk in resp.aiter_bytes():
+                            yield chunk
+                    finally:
+                        # Ensure cleanup
+                        if hasattr(resp, 'aclose'):
+                            try:
+                                await resp.aclose()
+                            except:
+                                pass
+                
                 from fastapi.responses import StreamingResponse
                 return StreamingResponse(
-                    resp.aiter_bytes(),
+                    stream_generator(),
                     status_code=resp.status_code,
-                    headers=dict(resp.headers),
+                    headers={k: v for k, v in resp.headers.items() if k.lower() not in ['transfer-encoding', 'content-encoding']},
                     media_type=resp.headers.get("content-type")
                 )
-            except httpx.ConnectError as e:
-                print(f"[PROXY] ConnectError: {e}")
-                raise HTTPException(status_code=503, detail="WebUI not available")
-            except Exception as e:
-                print(f"[PROXY] Error: {e}")
-                raise HTTPException(status_code=500, detail=str(e))
+        except httpx.ConnectError as e:
+            print(f"[PROXY] ConnectError: {e}")
+            raise HTTPException(status_code=503, detail="WebUI not available")
+        except Exception as e:
+            print(f"[PROXY] Error: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
 
     web_app.add_route("/{path:path}", proxy, methods=["*"])
     
