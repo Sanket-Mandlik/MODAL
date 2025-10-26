@@ -194,28 +194,12 @@ def run_webui():
 
     async def monitor_webui_output():
         """Monitor WebUI process output"""
-        global webui_ready
         try:
             while True:
                 line = webui_process.stdout.readline()
                 if not line:
                     break
-                line_str = line.strip()
-                print(f"[WEBUI-OUT] {line_str}")
-                # Check if WebUI is ready based on output
-                if "Running on local URL" in line_str or "Startup time:" in line_str:
-                    print("[WEBUI-OUT] WebUI appears ready, checking connection...")
-                    # Wait a bit for server to be fully ready
-                    await asyncio.sleep(2)
-                    # Try to connect once
-                    try:
-                        async with httpx.AsyncClient(timeout=5.0) as client:
-                            response = await client.get("http://localhost:7860")
-                            if response.status_code == 200:
-                                print("[WEBUI-OUT] Connection successful, marking as ready")
-                                webui_ready = True
-                    except Exception as e:
-                        print(f"[WEBUI-OUT] Connection check failed: {e}")
+                print(f"[WEBUI-OUT] {line.strip()}")
         except Exception as e:
             print(f"[WEBUI-OUT] Error reading output: {e}")
 
