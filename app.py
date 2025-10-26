@@ -107,59 +107,41 @@ def run_webui():
         target = os.readlink(webui_dir)
         print(f"[SYMLINK] Already exists → {target}")
 
-    # === Download model once ===
-    model_name = "v1-5-pruned-emaonly.safetensors"
-    model_path = vol_dir / model_name
-
-    print(f"[MODEL] Checking: {model_path}")
-
-    if model_path.exists():
-        size_gb = model_path.stat().st_size / (1024**3)
-        print(f"[MODEL] FOUND: {model_name} ({size_gb:.2f} GB) → Skipping download")
-    else:
-        print(f"[MODEL] NOT FOUND → Downloading {model_name}...")
-        import urllib.request
-        from tqdm import tqdm
-
-        url = "https://huggingface.co/runwayml/stable-diffusion-v1-5/resolve/main/v1-5-pruned-emaonly.safetensors"
-        try:
-            with urllib.request.urlopen(url) as r, open(model_path, "wb") as f:
-                total = int(r.headers.get("content-length", 0))
-                with tqdm(total=total, unit="iB", unit_scale=True, desc="Download") as pbar:
-                    while True:
-                        chunk = r.read(1024*1024)
-                        if not chunk:
-                            break
-                        f.write(chunk)
-                        pbar.update(len(chunk))
-            print("[MODEL] Download complete")
-        except Exception as e:
-            print(f"[MODEL] Download failed: {e}")
-            if model_path.exists():
-                model_path.unlink()
-            raise
-        finally:
-            vol.commit()
-            print("[VOLUME] Commit complete")
+    # === Check for models in volume ===
+    print(f"[MODEL] Checking volume for models...")
+    
+    try:
+        model_files = list(vol_dir.glob("*.safetensors")) + list(vol_dir.glob("*.ckpt"))
+        if model_files:
+            print(f"[MODEL] Found {len(model_files)} model(s) in volume:")
+            for model_file in model_files:
+                size_gb = model_file.stat().st_size / (1024**3)
+                print(f"  - {model_file.name} ({size_gb:.2f} GB)")
+        else:
+            print("[MODEL] No models found in volume. Please upload models via upload_model() function.")
+            print("[MODEL] You can use: python -m modal run app.py upload-model <path> stable-diffusion")
+    except Exception as e:
+        print(f"[MODEL] Error checking models: {e}")
 
     # === Start WebUI ===
     print("Starting WebUI on port 7860...")
     
-    # CRITICAL: Disable ControlNet hashing
+    # CRITICAL: Disable auto downloads and hashing
     env = os.environ.copy()
     env["CONTROLNET_NO_MODEL_HASH"] = "1"
+    # Removed HF_HUB_DISABLE_DOWNLOAD - was blocking SD WebUI startup
     
     # Start WebUI process
     print("[WEBUI] Starting subprocess...")
     webui_process = subprocess.Popen([
-        "python", "launch.py",
+        "python", "-u", "launch.py",  # -u flag for unbuffered output
         "--listen", "--port", "7860", "--api",
         "--disable-safe-unpickle", "--enable-insecure-extension-access",
         "--skip-torch-cuda-test", "--skip-install", "--skip-python-version-check",
         "--opt-sdp-attention", "--no-half-vae", "--medvram",
         "--disable-model-loading-ram-optimization",
-        "--no-hashing"  # ← ADD THIS: Disables ALL hashing (A1111 + ControlNet)
-    ], env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+        "--no-hashing"
+    ], env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=0)
     
     print(f"[WEBUI] Process started with PID: {webui_process.pid}")
 
@@ -212,12 +194,28 @@ def run_webui():
 
     async def monitor_webui_output():
         """Monitor WebUI process output"""
+        global webui_ready
         try:
             while True:
                 line = webui_process.stdout.readline()
                 if not line:
                     break
-                print(f"[WEBUI-OUT] {line.strip()}")
+                line_str = line.strip()
+                print(f"[WEBUI-OUT] {line_str}")
+                # Check if WebUI is ready based on output
+                if "Running on local URL" in line_str or "Startup time:" in line_str:
+                    print("[WEBUI-OUT] WebUI appears ready, checking connection...")
+                    # Wait a bit for server to be fully ready
+                    await asyncio.sleep(2)
+                    # Try to connect once
+                    try:
+                        async with httpx.AsyncClient(timeout=5.0) as client:
+                            response = await client.get("http://localhost:7860")
+                            if response.status_code == 200:
+                                print("[WEBUI-OUT] Connection successful, marking as ready")
+                                webui_ready = True
+                    except Exception as e:
+                        print(f"[WEBUI-OUT] Connection check failed: {e}")
         except Exception as e:
             print(f"[WEBUI-OUT] Error reading output: {e}")
 
