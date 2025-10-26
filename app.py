@@ -150,6 +150,7 @@ def run_webui():
     env["CONTROLNET_NO_MODEL_HASH"] = "1"
     
     # Start WebUI process
+    print("[WEBUI] Starting subprocess...")
     webui_process = subprocess.Popen([
         "python", "launch.py",
         "--listen", "--port", "7860", "--api",
@@ -159,14 +160,16 @@ def run_webui():
         "--disable-model-loading-ram-optimization",
         "--no-hashing"  # ← ADD THIS: Disables ALL hashing (A1111 + ControlNet)
     ], env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+    
+    print(f"[WEBUI] Process started with PID: {webui_process.pid}")
 
     # === FastAPI Proxy ===
     from fastapi import FastAPI, Request, HTTPException
+    from contextlib import asynccontextmanager
     import httpx
     import asyncio
     import time
 
-    web_app = FastAPI()
     webui_ready = False
 
     async def wait_for_webui():
@@ -174,21 +177,69 @@ def run_webui():
         global webui_ready
         max_wait = 300  # 5 minutes max
         start_time = time.time()
+        check_count = 0
+        
+        print("[WEBUI] Starting health check loop...")
         
         while time.time() - start_time < max_wait:
+            check_count += 1
+            
+            # Check if process is still running
+            if webui_process.poll() is not None:
+                print(f"[WEBUI] Process died with return code: {webui_process.returncode}")
+                return False
+            
             try:
-                async with httpx.AsyncClient(timeout=5.0) as client:
+                async with httpx.AsyncClient(timeout=10.0) as client:
                     response = await client.get("http://localhost:7860")
                     if response.status_code == 200:
-                        print("[WEBUI] Ready!")
+                        print(f"[WEBUI] Ready! (after {check_count} checks)")
                         webui_ready = True
                         return True
+                    else:
+                        print(f"[WEBUI] Check {check_count}: Got status {response.status_code}")
+            except httpx.ConnectError as e:
+                print(f"[WEBUI] Check {check_count}: Connection failed - {e}")
+            except httpx.TimeoutException:
+                print(f"[WEBUI] Check {check_count}: Timeout")
             except Exception as e:
-                print(f"[WEBUI] Not ready yet: {e}")
-                await asyncio.sleep(5)
+                print(f"[WEBUI] Check {check_count}: Error - {e}")
+            
+            await asyncio.sleep(10)  # Check every 10 seconds
         
-        print("[WEBUI] Timeout waiting for startup")
+        print(f"[WEBUI] Timeout after {check_count} checks")
         return False
+
+    async def monitor_webui_output():
+        """Monitor WebUI process output"""
+        try:
+            while True:
+                line = webui_process.stdout.readline()
+                if not line:
+                    break
+                print(f"[WEBUI-OUT] {line.strip()}")
+        except Exception as e:
+            print(f"[WEBUI-OUT] Error reading output: {e}")
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        # Startup
+        print("[STARTUP] Starting WebUI health check...")
+        asyncio.create_task(wait_for_webui())
+        asyncio.create_task(monitor_webui_output())
+        yield
+        # Shutdown
+        print("[SHUTDOWN] Cleaning up...")
+        if webui_process.poll() is None:
+            print("[SHUTDOWN] Terminating WebUI process...")
+            webui_process.terminate()
+            try:
+                webui_process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                print("[SHUTDOWN] Force killing WebUI process...")
+                webui_process.kill()
+
+    web_app = FastAPI(lifespan=lifespan)
 
     @web_app.get("/")
     async def root():
@@ -223,9 +274,6 @@ def run_webui():
                 raise HTTPException(status_code=503, detail="WebUI not available")
 
     web_app.add_route("/{path:path}", proxy, methods=["*"])
-    
-    # Start background task to wait for WebUI
-    asyncio.create_task(wait_for_webui())
     
     return web_app
 
