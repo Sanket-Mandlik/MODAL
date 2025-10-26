@@ -194,12 +194,20 @@ def run_webui():
 
     async def monitor_webui_output():
         """Monitor WebUI process output"""
+        global webui_ready
         try:
             while True:
                 line = webui_process.stdout.readline()
                 if not line:
                     break
-                print(f"[WEBUI-OUT] {line.strip()}")
+                line_str = line.strip()
+                print(f"[WEBUI-OUT] {line_str}")
+                # Check if WebUI is ready
+                if "Running on local URL" in line_str:
+                    print("[WEBUI-OUT] WebUI server is ready!")
+                    # Give it a moment to fully start
+                    await asyncio.sleep(2)
+                    webui_ready = True
         except Exception as e:
             print(f"[WEBUI-OUT] Error reading output: {e}")
 
@@ -239,21 +247,36 @@ def run_webui():
         if not webui_ready:
             raise HTTPException(status_code=503, detail="WebUI not ready")
         
+        # Build target URL
         url = f"http://localhost:7860{request.url.path}"
         if request.url.query:
             url += f"?{request.url.query}"
         
-        async with httpx.AsyncClient(timeout=60.0) as client:
+        print(f"[PROXY] {request.method} {request.url.path} -> {url}")
+        
+        async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
             try:
                 req = client.build_request(
                     request.method, url,
-                    headers=request.headers,
+                    headers={k: v for k, v in request.headers.items() if k.lower() not in ['host', 'content-length']},
                     content=await request.body()
                 )
                 resp = await client.send(req, stream=True)
-                return resp
-            except httpx.ConnectError:
+                
+                # Return streaming response with proper headers
+                from fastapi.responses import StreamingResponse
+                return StreamingResponse(
+                    resp.aiter_bytes(),
+                    status_code=resp.status_code,
+                    headers=dict(resp.headers),
+                    media_type=resp.headers.get("content-type")
+                )
+            except httpx.ConnectError as e:
+                print(f"[PROXY] ConnectError: {e}")
                 raise HTTPException(status_code=503, detail="WebUI not available")
+            except Exception as e:
+                print(f"[PROXY] Error: {e}")
+                raise HTTPException(status_code=500, detail=str(e))
 
     web_app.add_route("/{path:path}", proxy, methods=["*"])
     
