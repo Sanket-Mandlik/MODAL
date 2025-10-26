@@ -65,7 +65,7 @@ from modal import asgi_app
     image=image,
     gpu=GPU,
     volumes={"/models": vol},
-    timeout=7200,
+    timeout=180,
     startup_timeout=1800,
 )
 @asgi_app()
@@ -234,13 +234,6 @@ def run_webui():
 
     web_app = FastAPI(lifespan=lifespan)
 
-    @web_app.get("/")
-    async def root():
-        global webui_ready
-        if not webui_ready:
-            return {"message": "WebUI starting... please wait", "status": "starting"}
-        return {"message": "WebUI ready", "status": "ready"}
-
     @web_app.get("/health")
     async def health():
         global webui_ready
@@ -296,6 +289,8 @@ def run_webui():
             print(f"[PROXY] Error: {e}")
             raise HTTPException(status_code=500, detail=str(e))
 
+    # Add root route and catch-all proxy
+    web_app.add_route("/", proxy, methods=["*"])
     web_app.add_route("/{path:path}", proxy, methods=["*"])
     
     return web_app
