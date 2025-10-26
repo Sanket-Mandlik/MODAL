@@ -16,9 +16,9 @@ vol = modal.Volume.from_name("sd-models", create_if_missing=True)
 GPU = "L40S"
 
 # --------------------------------------------------------------------------- #
-# Image — ALL REQUIRED PACKAGES
+# Image — PRE-BUILD SNAPSHOT (WebUI + extensions + symlinks)
 # --------------------------------------------------------------------------- #
-image = (
+sd_webui_image = (
     modal.Image.debian_slim(python_version="3.11")
     .apt_install(
         "git", "wget", "curl", "libglib2.0-0", "libsm6", "libxext6", "libxrender1",
@@ -63,14 +63,15 @@ from modal import asgi_app
 import modal
 
 @app.function(
-    image=image,
-    gpu=GPU,
-    volumes={"/models": vol},
-    timeout=3600,  # 1 hour - prevent frequent restarts
-    startup_timeout=1800,
-    scaledown_window=300,  # Keep alive for 5 minutes (new name)
+    image=sd_webui_image,          # Snapshot – build once, reuse forever
+    gpu=GPU,                       # L40S GPU
+    volumes={"/models": vol},      # Persistent models
+    timeout=60,                 # 20 minutes - allow for image generation + response
+    startup_timeout=1800,         # BUILD/STARTUP CAN TAKE 30 MIN
+    scaledown_window=5,        # Keep alive for 30 seconds after request
 )
-@modal.concurrent(max_inputs=1)  # Prevent multiple instances
+
+@modal.concurrent(max_inputs=1)
 @asgi_app()
 def run_webui():
     os.chdir("/sd-webui")
@@ -140,15 +141,11 @@ def run_webui():
     # === Start WebUI ===
     print("Starting WebUI on port 7860...")
     
-    # CRITICAL: Disable auto downloads and hashing
     env = os.environ.copy()
     env["CONTROLNET_NO_MODEL_HASH"] = "1"
-    # Removed HF_HUB_DISABLE_DOWNLOAD - was blocking SD WebUI startup
-    
-    # Start WebUI process
-    print("[WEBUI] Starting subprocess...")
+
     webui_process = subprocess.Popen([
-        "python", "-u", "launch.py",  # -u flag for unbuffered output
+        "python", "-u", "launch.py",
         "--listen", "--port", "7860", "--api",
         "--disable-safe-unpickle", "--enable-insecure-extension-access",
         "--skip-torch-cuda-test", "--skip-install", "--skip-python-version-check",
@@ -161,6 +158,7 @@ def run_webui():
 
     # === FastAPI Proxy ===
     from fastapi import FastAPI, Request, HTTPException
+    from fastapi.responses import Response, StreamingResponse
     from contextlib import asynccontextmanager
     import httpx
     import asyncio
@@ -169,9 +167,8 @@ def run_webui():
     webui_ready = False
 
     async def wait_for_webui():
-        """Wait for WebUI to be ready"""
         global webui_ready
-        max_wait = 300  # 5 minutes max
+        max_wait = 300
         start_time = time.time()
         check_count = 0
         
@@ -180,7 +177,6 @@ def run_webui():
         while time.time() - start_time < max_wait:
             check_count += 1
             
-            # Check if process is still running
             if webui_process.poll() is not None:
                 print(f"[WEBUI] Process died with return code: {webui_process.returncode}")
                 return False
@@ -201,13 +197,12 @@ def run_webui():
             except Exception as e:
                 print(f"[WEBUI] Check {check_count}: Error - {e}")
             
-            await asyncio.sleep(10)  # Check every 10 seconds
+            await asyncio.sleep(10)
         
         print(f"[WEBUI] Timeout after {check_count} checks")
         return False
 
     async def monitor_webui_output():
-        """Monitor WebUI process output"""
         global webui_ready
         try:
             while True:
@@ -216,10 +211,8 @@ def run_webui():
                     break
                 line_str = line.strip()
                 print(f"[WEBUI-OUT] {line_str}")
-                # Check if WebUI is ready
                 if "Running on local URL" in line_str:
                     print("[WEBUI-OUT] WebUI server is ready!")
-                    # Give it a moment to fully start
                     await asyncio.sleep(2)
                     webui_ready = True
         except Exception as e:
@@ -227,18 +220,14 @@ def run_webui():
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        # Startup
         print("[STARTUP] Starting WebUI health check...")
         output_task = asyncio.create_task(monitor_webui_output())
-        # Wait for WebUI to be ready
         await wait_for_webui()
         print("[STARTUP] FastAPI app ready!")
         
-        # Keep monitoring task running
         try:
             yield
         finally:
-            # Shutdown
             print("[SHUTDOWN] Cleaning up...")
             output_task.cancel()
             try:
@@ -277,31 +266,91 @@ def run_webui():
         
         try:
             # Increased timeout for image generation POST requests
-            timeout = httpx.Timeout(60.0, connect=10.0, read=600.0, write=60.0, pool=10.0)
+            # Set read timeout to 1800s (30 min) to allow for large image responses
+            is_img_gen = request.url.path in ["/sdapi/v1/txt2img", "/sdapi/v1/img2img"]
+            read_timeout = 1800.0 if is_img_gen else 600.0
+            timeout = httpx.Timeout(60.0, connect=10.0, read=read_timeout, write=60.0, pool=10.0)
+            print(f"[PROXY] Timeout config: read={read_timeout}s for {'image gen' if is_img_gen else 'regular'} request")
             async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
-                # For ALL requests (GET, POST, etc), fetch full response (not streaming)
-                # This ensures we get the complete response without ReadError
+                # For ALL requests (GET, POST, etc), use streaming to avoid hanging
                 if request.method in ["GET", "POST", "PUT", "PATCH"]:
                     print(f"[PROXY] Fetching full response for {request.method} {request.url.path}")
+                    
+                    # Get request body
+                    body_data = await request.body()
+                    print(f"[PROXY] Request body size: {len(body_data)} bytes")
+                    
                     # Use the correct HTTP method
                     req = client.build_request(
                         request.method, url,
                         headers={k: v for k, v in request.headers.items() if k.lower() not in ['host', 'content-length']},
-                        content=await request.body()
+                        content=body_data
                     )
-                    resp = await client.send(req, stream=False)
-                    print(f"[PROXY] Got response: {resp.status_code}, size: {len(resp.content) if resp.content else 0} bytes")
                     
-                    from fastapi.responses import Response
+                    print(f"[PROXY] Sending request to WebUI with streaming...")
+                    try:
+                        # Use streaming=True to read response as it comes
+                        resp = await client.send(req, stream=True)
+                        print(f"[PROXY] Response received: {resp.status_code}, headers: {dict(resp.headers)}")
+                    except httpx.ReadTimeout as e:
+                        print(f"[PROXY] ERROR: Read timeout - {e}")
+                        raise HTTPException(status_code=504, detail="Request to WebUI timed out")
+                    except Exception as e:
+                        print(f"[PROXY] ERROR sending request: {e}")
+                        raise
+                    
+                    # Collect all chunks from the streaming response
+                    print(f"[PROXY] Reading response content in chunks...")
+                    chunks = []
+                    total_size = 0
+                    async for chunk in resp.aiter_bytes(chunk_size=65536):  # Read in 64KB chunks
+                        chunks.append(chunk)
+                        total_size += len(chunk)
+                        print(f"[PROXY] Received chunk: {len(chunk)} bytes (total: {total_size} bytes)")
+                    
+                    # Combine all chunks
+                    content = b''.join(chunks)
+                    print(f"[PROXY] Total response content: {len(content)} bytes")
+                    
+                    # For debugging, verify the response contains base64 image data
+                    if content:
+                        try:
+                            import json
+                            response_data = json.loads(content.decode('utf-8'))
+                            print(f"[PROXY] Response is valid JSON with keys: {list(response_data.keys())}")
+                            
+                            # Check if it has images array (base64 format)
+                            if 'images' in response_data:
+                                num_images = len(response_data['images'])
+                                # Check if first image is base64
+                                if response_data['images']:
+                                    first_image = response_data['images'][0]
+                                    if first_image.startswith('data:image'):
+                                        print(f"[PROXY] ✅ Response contains {num_images} image(s) in base64 format")
+                                        print(f"[PROXY] First image base64 length: {len(first_image)} chars")
+                                    else:
+                                        print(f"[PROXY] ⚠️ First image doesn't appear to be base64: {first_image[:100]}")
+                        except Exception as e:
+                            print(f"[PROXY] Response is not valid JSON: {e}")
+                            print(f"[PROXY] First 100 bytes: {content[:100]}")
+                    
+                    # Close the response
+                    try:
+                        await resp.aclose()
+                    except:
+                        pass
+                    
                     # Filter problematic headers and add content-length
                     filtered_headers = {}
                     for k, v in resp.headers.items():
                         if k.lower() not in ['transfer-encoding', 'content-encoding', 'connection']:
                             filtered_headers[k] = v
                     # Explicitly set content-length for proper response
-                    filtered_headers['content-length'] = str(len(resp.content))
+                    filtered_headers['content-length'] = str(len(content))
+                    
+                    print(f"[PROXY] Returning response with {len(content)} bytes")
                     return Response(
-                        content=resp.content,
+                        content=content,
                         status_code=resp.status_code,
                         headers=filtered_headers,
                         media_type=resp.headers.get("content-type")
@@ -331,7 +380,6 @@ def run_webui():
                                 except:
                                     pass
                     
-                    from fastapi.responses import StreamingResponse
                     return StreamingResponse(
                         stream_generator(),
                         status_code=resp.status_code,
@@ -345,6 +393,8 @@ def run_webui():
             print(f"[PROXY] Error: {e}")
             raise HTTPException(status_code=500, detail=str(e))
 
+
+        
     # Catch-all proxy route
     web_app.add_route("/{full_path:path}", proxy, methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"])
     web_app.api_route("/", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"])(proxy)
@@ -354,7 +404,7 @@ def run_webui():
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
-@app.function(image=image, volumes={"/models": vol})
+@app.function(image=sd_webui_image, volumes={"/models": vol})
 def upload_model(local_path: str, model_type: str = "stable-diffusion"):
     mapping = {
         "stable-diffusion": "/Stable-diffusion",
@@ -369,7 +419,7 @@ def upload_model(local_path: str, model_type: str = "stable-diffusion"):
     vol.commit()
     print(f"Uploaded {local_path} → {remote}")
 
-@app.function(image=image, volumes={"/models": vol})
+@app.function(image=sd_webui_image, volumes={"/models": vol})
 def list_models():
     print("=== Volume Contents ===")
     try:
@@ -383,7 +433,7 @@ def list_models():
     except Exception as e:
         print(f"Error listing volume: {e}")
 
-@app.function(image=image, gpu=GPU)
+@app.function(image=sd_webui_image, gpu=GPU)
 def test_gpu():
     import torch
     print("CUDA:", torch.cuda.is_available())
