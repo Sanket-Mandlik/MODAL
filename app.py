@@ -57,9 +57,7 @@ sd_webui_image = (
         "cd /sd-webui/extensions && git clone https://github.com/Mikubill/sd-webui-controlnet.git",
         "mkdir -p /sd-webui/embeddings /sd-webui/outputs /sd-webui/models/ControlNet /sd-webui/models/Stable-diffusion",
         # Clear any existing cache and ensure clean SDXL setup
-        "rm -rf /sd-webui/cache /sd-webui/models//.*cache /sd-webui/models//.*tmp",
-        # Download base SDXL model as fallback (full size model)
-
+        "rm -rf /sd-webui/cache /sd-webui/models/*/.*cache* /sd-webui/models/*/.*tmp*",
         # Ensure proper permissions for model directories
         "chmod -R 755 /sd-webui/models"
     )
@@ -140,6 +138,35 @@ def run_webui():
         else:
             target = os.readlink(webui_dir)
             print(f"[SYMLINK] Already exists {webui_dir.name} → {target}")
+        
+        # Verify symlink works by listing files
+        try:
+            symlink_files = [p.name for p in webui_dir.iterdir()]
+            print(f"[SYMLINK] Files accessible via {webui_dir.name}: {symlink_files}")
+        except Exception as e:
+            print(f"[SYMLINK] Error listing files in {webui_dir.name}: {e}")
+    
+    # === Rename ControlNet models to working SDXL format ===
+    print("[CONTROLNET] Renaming ControlNet models to working SDXL format...")
+    try:
+        cn_webui_dir = Path("/sd-webui/models/ControlNet")
+        if cn_webui_dir.exists():
+            # Rename canny.safetensors to controlnet-canny-sdxl.safetensors
+            canny_file = cn_webui_dir / "canny.safetensors"
+            if canny_file.exists():
+                new_canny_name = "controlnet-canny-sdxl.safetensors"
+                canny_file.rename(cn_webui_dir / new_canny_name)
+                print(f"[CONTROLNET] Renamed: canny.safetensors → {new_canny_name}")
+            
+            # Rename depth.safetensors to controlnet-depth-sdxl.safetensors
+            depth_file = cn_webui_dir / "depth.safetensors"
+            if depth_file.exists():
+                new_depth_name = "controlnet-depth-sdxl.safetensors"
+                depth_file.rename(cn_webui_dir / new_depth_name)
+                print(f"[CONTROLNET] Renamed: depth.safetensors → {new_depth_name}")
+                
+    except Exception as e:
+        print(f"[CONTROLNET] Error renaming models: {e}")
 
     # === Check for SDXL models in volume ===
     print(f"[MODEL] Checking volume for SDXL models...")
@@ -158,7 +185,7 @@ def run_webui():
     
     # Check SDXL checkpoints
     try:
-        sd_model_files = list(vol_sd_dir.glob(".safetensors")) + list(vol_sd_dir.glob(".ckpt"))
+        sd_model_files = list(vol_sd_dir.glob("*.safetensors")) + list(vol_sd_dir.glob("*.ckpt"))
         if sd_model_files:
             print(f"[MODEL] Found {len(sd_model_files)} SDXL checkpoint(s):")
             for model_file in sd_model_files:
@@ -171,7 +198,7 @@ def run_webui():
     
     # Check ControlNet models
     try:
-        cn_model_files = list(vol_cn_dir.glob(".safetensors")) + list(vol_cn_dir.glob(".pth"))
+        cn_model_files = list(vol_cn_dir.glob("*.safetensors")) + list(vol_cn_dir.glob("*.pth"))
         if cn_model_files:
             print(f"[MODEL] Found {len(cn_model_files)} ControlNet model(s):")
             for model_file in cn_model_files:
@@ -206,6 +233,20 @@ def run_webui():
     ], env=env, stdout=None, stderr=None)  # Don't capture output - let it go directly to Modal logs
     
     print(f"[WEBUI] Process started with PID: {webui_process.pid}")
+    
+    # === Verify ControlNet models are accessible ===
+    print("[CONTROLNET] Verifying ControlNet models are accessible...")
+    try:
+        cn_webui_dir = Path("/sd-webui/models/ControlNet")
+        if cn_webui_dir.exists():
+            cn_files = list(cn_webui_dir.glob("*.safetensors"))
+            print(f"[CONTROLNET] Found {len(cn_files)} ControlNet models in WebUI directory:")
+            for cn_file in cn_files:
+                print(f"  - {cn_file.name}")
+        else:
+            print("[CONTROLNET] ControlNet directory not found!")
+    except Exception as e:
+        print(f"[CONTROLNET] Error checking ControlNet models: {e}")
 
     # === FastAPI Proxy ===
     from fastapi import FastAPI, Request, HTTPException
@@ -371,7 +412,7 @@ def run_webui():
                                         print(f"[PROXY] ✅ Response contains {num_images} image(s) in base64 format")
                                         print(f"[PROXY] First image base64 length: {len(first_image)} chars")
                                     else:
-                                        print(f"[PROXY] ⚠ First image doesn't appear to be base64: {first_image[:100]}")
+                                        print(f"[PROXY] ⚠️ First image doesn't appear to be base64: {first_image[:100]}")
                         except Exception as e:
                             print(f"[PROXY] Response is not valid JSON: {e}")
                             print(f"[PROXY] First 100 bytes: {content[:100]}")
