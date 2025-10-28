@@ -7,7 +7,7 @@ from pathlib import Path
 # --------------------------------------------------------------------------- #
 # Modal App
 # --------------------------------------------------------------------------- #
-app = modal.App("sd-webui-controlnet")
+app = modal.App("sd-webui-controlnet-sdxl")  # Changed app name to force fresh build
 
 # Persistent volume
 vol = modal.Volume.from_name("sd-models", create_if_missing=True)
@@ -16,13 +16,13 @@ vol = modal.Volume.from_name("sd-models", create_if_missing=True)
 GPU = "L40S"
 
 # --------------------------------------------------------------------------- #
-# Image — PRE-BUILD SNAPSHOT (WebUI + extensions + symlinks)
+# Image — PRE-BUILD SNAPSHOT (WebUI + extensions + symlinks) - SDXL Version
 # --------------------------------------------------------------------------- #
 sd_webui_image = (
     modal.Image.debian_slim(python_version="3.11")
     .apt_install(
         "git", "wget", "curl", "libglib2.0-0", "libsm6", "libxext6", "libxrender1",
-        "libgl1-mesa-glx"
+        "libgl1-mesa-glx", "cmake", "build-essential", "pkg-config", "libhdf5-dev"
     )
     .run_commands(
         "pip install --upgrade pip",
@@ -39,11 +39,14 @@ sd_webui_image = (
         # ControlNet & Preprocessors
         "controlnet-aux", "facexlib", "gfpgan",
 
+        # SDXL-specific dependencies (core only)
+        "diffusers>=0.21.0", "compel>=2.0.0",
+
         # Others
         "pytorch-lightning==1.9.0", "safetensors", "timm", "kornia",
         "GitPython", "blendmodes", "clean-fid", "diskcache",
         "fastapi>=0.90.1", "inflection", "jsonmerge",
-        "lark", "open-clip-torch", "piexif", "protobuf==3.20.0",
+        "lark", "open-clip-torch==2.24.0", "piexif", "protobuf==3.20.0",
         "psutil", "requests", "resize-right", "scikit-image>=0.19",
         "tomesd", "torchdiffeq", "torchsde", "ftfy", "regex",
         "taming-transformers", "clip", "httpx", "anyio"
@@ -52,7 +55,13 @@ sd_webui_image = (
         "git clone https://github.com/AUTOMATIC1111/stable-diffusion-webui.git /sd-webui",
         "cd /sd-webui && git checkout v1.10.1",
         "cd /sd-webui/extensions && git clone https://github.com/Mikubill/sd-webui-controlnet.git",
-        "mkdir -p /sd-webui/embeddings /sd-webui/outputs"
+        "mkdir -p /sd-webui/embeddings /sd-webui/outputs /sd-webui/models/ControlNet /sd-webui/models/Stable-diffusion",
+        # Clear any existing cache and ensure clean SDXL setup
+        "rm -rf /sd-webui/cache /sd-webui/models/*/.*cache* /sd-webui/models/*/.*tmp*",
+        # Download base SDXL model as fallback (full size model)
+
+        # Ensure proper permissions for model directories
+        "chmod -R 755 /sd-webui/models"
     )
 )
 
@@ -76,73 +85,112 @@ import modal
 def run_webui():
     os.chdir("/sd-webui")
 
+    # === Clear SD 1.5 Cache and Setup SDXL ===
+    print("[CACHE] Clearing SD 1.5 cache and preparing for SDXL...")
+    
+    # Clear WebUI cache directories
+    cache_dirs = [
+        "/sd-webui/cache",
+        "/sd-webui/models/Stable-diffusion",
+        "/sd-webui/models/ControlNet",
+        "/sd-webui/models/VAE",
+        "/sd-webui/models/Lora"
+    ]
+    
+    for cache_dir in cache_dirs:
+        cache_path = Path(cache_dir)
+        if cache_path.exists() and not cache_path.is_symlink():
+            print(f"[CACHE] Removing old cache: {cache_dir}")
+            import shutil
+            shutil.rmtree(cache_path, ignore_errors=True)
+
     # === Volume & Symlink Setup ===
-    vol_dir = Path("/models/Stable-diffusion")
-    webui_dir = Path("/sd-webui/models/Stable-diffusion")
-    vol_dir.mkdir(parents=True, exist_ok=True)
+    vol_sd_dir = Path("/models/Stable-diffusion")
+    vol_cn_dir = Path("/models/ControlNet")
+    webui_sd_dir = Path("/sd-webui/models/Stable-diffusion")
+    webui_cn_dir = Path("/sd-webui/models/ControlNet")
+    
+    # Ensure volume directories exist
+    vol_sd_dir.mkdir(parents=True, exist_ok=True)
+    vol_cn_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"[DEBUG] Volume mount: /models")
-    print(f"[DEBUG] Volume dir exists: {vol_dir.exists()}")
-    print(f"[DEBUG] WebUI dir exists: {webui_dir.exists()}")
+    print(f"[DEBUG] SD volume dir exists: {vol_sd_dir.exists()}")
+    print(f"[DEBUG] ControlNet volume dir exists: {vol_cn_dir.exists()}")
 
-    # List files in volume
+    # List files in volume directories
     try:
-        files = [p.name for p in vol_dir.iterdir()]
-        print(f"[DEBUG] Files in /models/Stable-diffusion: {files}")
+        sd_files = [p.name for p in vol_sd_dir.iterdir()]
+        cn_files = [p.name for p in vol_cn_dir.iterdir()]
+        print(f"[DEBUG] Files in /models/Stable-diffusion: {sd_files}")
+        print(f"[DEBUG] Files in /models/ControlNet: {cn_files}")
     except Exception as e:
-        print(f"[DEBUG] Could not list volume dir: {e}")
+        print(f"[DEBUG] Could not list volume dirs: {e}")
 
-    # Clean up old real directory if exists
-    if webui_dir.exists() and not webui_dir.is_symlink():
-        print(f"[CLEANUP] Removing old real directory: {webui_dir}")
-        import shutil
-        shutil.rmtree(webui_dir, ignore_errors=True)
+    # Create symlinks for both directories
+    for vol_dir, webui_dir in [(vol_sd_dir, webui_sd_dir), (vol_cn_dir, webui_cn_dir)]:
+        if not webui_dir.is_symlink():
+            print(f"[SYMLINK] Creating: {vol_dir} → {webui_dir}")
+            try:
+                os.symlink(vol_dir, webui_dir)
+                print(f"[SYMLINK] Success for {webui_dir.name}")
+            except Exception as e:
+                print(f"[SYMLINK] Failed for {webui_dir.name}: {e}")
+                raise
+        else:
+            target = os.readlink(webui_dir)
+            print(f"[SYMLINK] Already exists {webui_dir.name} → {target}")
 
-    # Always (re)create symlink
-    if not webui_dir.is_symlink():
-        print(f"[SYMLINK] Creating: {vol_dir} → {webui_dir}")
+    # === Check for SDXL models in volume ===
+    print(f"[MODEL] Checking volume for SDXL models...")
+    
+    # Clean up partial downloads from both directories
+    for vol_dir in [vol_sd_dir, vol_cn_dir]:
         try:
-            os.symlink(vol_dir, webui_dir)
-            print("[SYMLINK] Success")
+            partial_files = list(vol_dir.glob("*.partial"))
+            if partial_files:
+                print(f"[CLEANUP] Removing {len(partial_files)} partial download(s) from {vol_dir.name}...")
+                for partial_file in partial_files:
+                    partial_file.unlink()
+                    print(f"  Removed: {partial_file.name}")
         except Exception as e:
-            print(f"[SYMLINK] Failed: {e}")
-            raise
-    else:
-        target = os.readlink(webui_dir)
-        print(f"[SYMLINK] Already exists → {target}")
-
-    # === Check for models in volume ===
-    print(f"[MODEL] Checking volume for models...")
+            print(f"[CLEANUP] Error removing partial files from {vol_dir.name}: {e}")
     
-    # Clean up partial downloads
+    # Check SDXL checkpoints
     try:
-        partial_files = list(vol_dir.glob("*.partial"))
-        if partial_files:
-            print(f"[CLEANUP] Removing {len(partial_files)} partial download(s)...")
-            for partial_file in partial_files:
-                partial_file.unlink()
-                print(f"  Removed: {partial_file.name}")
-    except Exception as e:
-        print(f"[CLEANUP] Error removing partial files: {e}")
-    
-    try:
-        model_files = list(vol_dir.glob("*.safetensors")) + list(vol_dir.glob("*.ckpt"))
-        if model_files:
-            print(f"[MODEL] Found {len(model_files)} model(s) in volume:")
-            for model_file in model_files:
+        sd_model_files = list(vol_sd_dir.glob("*.safetensors")) + list(vol_sd_dir.glob("*.ckpt"))
+        if sd_model_files:
+            print(f"[MODEL] Found {len(sd_model_files)} SDXL checkpoint(s):")
+            for model_file in sd_model_files:
                 size_gb = model_file.stat().st_size / (1024**3)
                 print(f"  - {model_file.name} ({size_gb:.2f} GB)")
         else:
-            print("[MODEL] No models found in volume. Please upload models via upload_model() function.")
-            print("[MODEL] You can use: python -m modal run app.py upload-model <path> stable-diffusion")
+            print("[MODEL] No SDXL checkpoints found in volume.")
     except Exception as e:
-        print(f"[MODEL] Error checking models: {e}")
+        print(f"[MODEL] Error checking SDXL checkpoints: {e}")
+    
+    # Check ControlNet models
+    try:
+        cn_model_files = list(vol_cn_dir.glob("*.safetensors")) + list(vol_cn_dir.glob("*.pth"))
+        if cn_model_files:
+            print(f"[MODEL] Found {len(cn_model_files)} ControlNet model(s):")
+            for model_file in cn_model_files:
+                size_gb = model_file.stat().st_size / (1024**3)
+                print(f"  - {model_file.name} ({size_gb:.2f} GB)")
+        else:
+            print("[MODEL] No ControlNet models found in volume.")
+    except Exception as e:
+        print(f"[MODEL] Error checking ControlNet models: {e}")
 
-    # === Start WebUI ===
-    print("Starting WebUI on port 7860...")
+    # === Start WebUI with SDXL optimizations ===
+    print("Starting WebUI with SDXL optimizations on port 7860...")
     
     env = os.environ.copy()
     env["CONTROLNET_NO_MODEL_HASH"] = "1"
+    # Clear any SD 1.5 cache environment variables
+    env.pop("SD_WEBUI_CACHE_DIR", None)
+    env.pop("HF_HOME", None)
+    env.pop("TRANSFORMERS_CACHE", None)
 
     webui_process = subprocess.Popen([
         "python", "-u", "launch.py",
@@ -151,7 +199,10 @@ def run_webui():
         "--skip-torch-cuda-test", "--skip-install", "--skip-python-version-check",
         "--opt-sdp-attention", "--no-half-vae", "--medvram",
         "--disable-model-loading-ram-optimization",
-        "--no-hashing"
+        "--no-hashing", "--no-download-sd-model",  # Don't auto-download SD 1.5 models
+        "--xformers",  # Better memory efficiency for SDXL
+        "--disable-nan-check",  # SDXL compatibility
+        "--api-log"  # Enable API logging for debugging
     ], env=env, stdout=None, stderr=None)  # Don't capture output - let it go directly to Modal logs
     
     print(f"[WEBUI] Process started with PID: {webui_process.pid}")
