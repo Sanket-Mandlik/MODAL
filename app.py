@@ -111,6 +111,21 @@ def run_webui():
         target = os.readlink(webui_dir)
         print(f"[SYMLINK] Already exists → {target}")
 
+    # === Setup ControlNet models directory ===
+    controlnet_vol = Path("/models")
+    controlnet_webui = Path("/sd-webui/models")
+    
+    print(f"[CONTROLNET] Checking volume...")
+    try:
+        vol_files = list(controlnet_vol.glob("*.safetensors"))
+        if vol_files:
+            print(f"[CONTROLNET] Found {len(vol_files)} ControlNet model(s) in volume root:")
+            for f in vol_files:
+                size_gb = f.stat().st_size / (1024**3)
+                print(f"  - {f.name} ({size_gb:.2f} GB)")
+    except Exception as e:
+        print(f"[CONTROLNET] Error checking volume: {e}")
+
     # === Check for models in volume ===
     print(f"[MODEL] Checking volume for models...")
     
@@ -390,19 +405,58 @@ def run_webui():
 # Helpers
 # --------------------------------------------------------------------------- #
 @app.function(image=sd_webui_image, volumes={"/models": vol})
-def upload_model(local_path: str, model_type: str = "stable-diffusion"):
-    mapping = {
-        "stable-diffusion": "/Stable-diffusion",
-        "controlnet": "/ControlNet",
-        "lora": "/Lora",
-        "vae": "/VAE",
-    }
-    if model_type not in mapping:
-        raise ValueError(f"Invalid type: {list(mapping)}")
-    remote = f"{mapping[model_type]}/{Path(local_path).name}"
-    vol.put_file(remote, local_path)
-    vol.commit()
-    print(f"Uploaded {local_path} → {remote}")
+def move_juggernaut():
+    """Move Juggernaut model from root to Stable-diffusion folder"""
+    import shutil
+    from pathlib import Path
+    
+    src = Path("/models/Juggernaut-XI-byRunDiffusion.safetensors")
+    dst = Path("/models/Stable-diffusion/Juggernaut-XI-byRunDiffusion.safetensors")
+    
+    if not src.exists():
+        print(f"❌ Source file not found: {src}")
+        return
+    
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    print(f"📦 Moving {src.name} to Stable-diffusion folder...")
+    shutil.move(str(src), str(dst))
+    print(f"✅ Moved to {dst}")
+
+@app.function(image=sd_webui_image, volumes={"/models": vol})
+def move_canny():
+    """Move Canny model from root to ControlNet folder"""
+    import shutil
+    from pathlib import Path
+    
+    src = Path("/models/canny.safetensors")
+    dst = Path("/models/ControlNet/canny.safetensors")
+    
+    if not src.exists():
+        print(f"❌ Source file not found: {src}")
+        return
+    
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    print(f"📦 Moving {src.name} to ControlNet folder...")
+    shutil.move(str(src), str(dst))
+    print(f"✅ Moved to {dst}")
+
+@app.function(image=sd_webui_image, volumes={"/models": vol})
+def move_depth():
+    """Move Depth model from root to ControlNet folder"""
+    import shutil
+    from pathlib import Path
+    
+    src = Path("/models/depth.safetensors")
+    dst = Path("/models/ControlNet/depth.safetensors")
+    
+    if not src.exists():
+        print(f"❌ Source file not found: {src}")
+        return
+    
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    print(f"📦 Moving {src.name} to ControlNet folder...")
+    shutil.move(str(src), str(dst))
+    print(f"✅ Moved to {dst}")
 
 @app.function(image=sd_webui_image, volumes={"/models": vol})
 def list_models():
