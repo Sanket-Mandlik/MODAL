@@ -57,7 +57,7 @@ sd_webui_image = (
         "cd /sd-webui/extensions && git clone https://github.com/Mikubill/sd-webui-controlnet.git",
         "mkdir -p /sd-webui/embeddings /sd-webui/outputs /sd-webui/models/ControlNet /sd-webui/models/Stable-diffusion",
         # Clear any existing cache and ensure clean SDXL setup
-        "rm -rf /sd-webui/cache /sd-webui/models/*/.*cache* /sd-webui/models/*/.*tmp*",
+        "rm -rf /sd-webui/cache /sd-webui/models//.*cache /sd-webui/models//.*tmp",
         # Download base SDXL model as fallback (full size model)
 
         # Ensure proper permissions for model directories
@@ -158,7 +158,7 @@ def run_webui():
     
     # Check SDXL checkpoints
     try:
-        sd_model_files = list(vol_sd_dir.glob("*.safetensors")) + list(vol_sd_dir.glob("*.ckpt"))
+        sd_model_files = list(vol_sd_dir.glob(".safetensors")) + list(vol_sd_dir.glob(".ckpt"))
         if sd_model_files:
             print(f"[MODEL] Found {len(sd_model_files)} SDXL checkpoint(s):")
             for model_file in sd_model_files:
@@ -171,7 +171,7 @@ def run_webui():
     
     # Check ControlNet models
     try:
-        cn_model_files = list(vol_cn_dir.glob("*.safetensors")) + list(vol_cn_dir.glob("*.pth"))
+        cn_model_files = list(vol_cn_dir.glob(".safetensors")) + list(vol_cn_dir.glob(".pth"))
         if cn_model_files:
             print(f"[MODEL] Found {len(cn_model_files)} ControlNet model(s):")
             for model_file in cn_model_files:
@@ -371,7 +371,7 @@ def run_webui():
                                         print(f"[PROXY] ✅ Response contains {num_images} image(s) in base64 format")
                                         print(f"[PROXY] First image base64 length: {len(first_image)} chars")
                                     else:
-                                        print(f"[PROXY] ⚠️ First image doesn't appear to be base64: {first_image[:100]}")
+                                        print(f"[PROXY] ⚠ First image doesn't appear to be base64: {first_image[:100]}")
                         except Exception as e:
                             print(f"[PROXY] Response is not valid JSON: {e}")
                             print(f"[PROXY] First 100 bytes: {content[:100]}")
